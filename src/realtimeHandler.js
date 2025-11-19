@@ -23,8 +23,9 @@ export function attachRealtimeServer(server) {
     }
 
     let streamSid = null;
-    let userSpeaking = false;
     let activeResponse = false;
+    let currentResponseId = null;
+    let userSpeaking = false;
 
     socket.on('message', (data, isBinary) => {
       try {
@@ -70,34 +71,48 @@ export function attachRealtimeServer(server) {
         const message = JSON.parse(data.toString());
         const type = message.type;
 
-        // When the user starts speaking, stop sending any further audio to Twilio
-        // and cancel the current model response (barge-in behavior).
+        // User has started speaking: cancel any in-flight response and stop audio.
         if (type === 'input_audio_buffer.speech_started') {
           console.log('[OpenAI] event=input_audio_buffer.speech_started');
           userSpeaking = true;
 
-          if (activeResponse && openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
+          if (streamSid && socket.readyState === WebSocket.OPEN) {
             try {
-              openaiSocket.send(JSON.stringify({ type: 'response.cancel' }));
-              console.log('[OpenAI] sent response.cancel for active response');
+              socket.send(
+                JSON.stringify({
+                  event: 'clear',
+                  streamSid,
+                })
+              );
+              console.log('[Realtime] sent clear event to Twilio');
+            } catch (err) {
+              console.warn('[Realtime] failed to send clear event to Twilio', err);
+            }
+          }
+
+          if (activeResponse && currentResponseId && openaiSocket.readyState === WebSocket.OPEN) {
+            try {
+              openaiSocket.send(
+                JSON.stringify({
+                  type: 'response.cancel',
+                  response_id: currentResponseId,
+                })
+              );
+              console.log('[OpenAI] sent response.cancel for active response', currentResponseId);
             } catch (err) {
               console.warn('[OpenAI] failed to send response.cancel', err);
             }
-          } else {
-            console.log('[OpenAI] speech_started but no active response to cancel');
           }
 
           // Do not process any other handlers for this event.
           return;
         }
 
-        // When a new response is created (for the latest user utterance),
-        // allow audio to flow again to Twilio.
-        if (type === 'response.created') {
-          console.log('[OpenAI] event=response.created');
-          userSpeaking = false;
+        if (type === 'response.created' && message.response && message.response.id) {
+          currentResponseId = message.response.id;
           activeResponse = true;
-          // Fall through so we don't skip other generic logging if added later.
+          userSpeaking = false; // model is now speaking
+          console.log('[OpenAI] event=response.created id=', currentResponseId);
         }
 
         if (type === 'session.created' || type === 'session.updated') {
@@ -118,11 +133,8 @@ export function attachRealtimeServer(server) {
 
           if (!audioChunk || !streamSid) return;
 
-          // If the user is currently speaking, do not send any more audio
-          // back to Twilio for this response (barge-in).
-          if (userSpeaking) {
-            return;
-          }
+          // If user has started speaking or response is no longer active, stop sending audio.
+          if (userSpeaking || !activeResponse) return;
 
           console.log('[OpenAI] event=response.output_audio.delta');
 
@@ -135,9 +147,13 @@ export function attachRealtimeServer(server) {
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify(twilioMedia));
           }
-        } else if (type === 'response.output_audio.done') {
+        } else if (
+          type === 'response.output_audio.done' ||
+          type === 'response.done' ||
+          type === 'response.cancelled'
+        ) {
           activeResponse = false;
-          console.log('[OpenAI] event=response.output_audio.done payload:', JSON.stringify(message, null, 2));
+          console.log('[OpenAI] event=response.end type=', type);
         } else if (type === 'error') {
           console.error('[OpenAI] error event payload:', JSON.stringify(message, null, 2));
         } else {
