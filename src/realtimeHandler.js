@@ -1,4 +1,25 @@
 import WebSocket, { WebSocketServer } from 'ws';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const admin = require('firebase-admin');
+const serviceAccount = require('../serviceAccountKey.json');
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    projectId: 'voice-order-react',
+  });
+}
+
+const db = admin.firestore();
+
+const DEFAULT_RESTAURANT = {
+  id: 'usFxbahxRibPEAWbVUAO',
+  name: "Joe's Pizza",
+  restaurantId: 'usFxbahxRibPEAWbVUAO',
+  twilioNumber: '3475551234',
+};
 
 const DEFAULT_REALTIME_ENDPOINT =
   process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime';
@@ -14,7 +35,9 @@ export function attachRealtimeServer(server) {
     const callSid = request.headers['x-twilio-call-sid'];
     console.log('Twilio stream connected');
     console.log(`[Realtime] Twilio stream connected${callSid ? ` for CallSid=${callSid}` : ''}`);
-    
+
+    const currentRestaurant = DEFAULT_RESTAURANT;
+
     const openaiSocket = connectToOpenAI();
     if (!openaiSocket) {
       console.error('[OpenAI] Failed to create OpenAI WebSocket; closing Twilio stream');
@@ -73,7 +96,7 @@ export function attachRealtimeServer(server) {
     });
 
     // Handle messages from OpenAI and forward audio deltas back to Twilio.
-    openaiSocket.on('message', (data) => {
+    openaiSocket.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString());
         const type = message.type;
@@ -166,6 +189,12 @@ export function attachRealtimeServer(server) {
                   console.warn('[Order Tool Payload] failed to send tool output', err);
                 }
               }
+
+              try {
+                await submitOrderToFirebase(payload, currentRestaurant);
+              } catch (err) {
+                console.error('[Firebase] order create wrapper failed', err);
+              }
             } catch (err) {
               console.warn('[Order Tool Payload] failed to parse arguments', err);
             }
@@ -244,7 +273,7 @@ export function attachRealtimeServer(server) {
       }
     });
 
-    socket.on('close', (code, reason) => {
+    socket.on('close', async (code, reason) => {
       const reasonText = normalizeReason(reason);
       console.log('Twilio stream closed');
       console.log(
@@ -253,6 +282,11 @@ export function attachRealtimeServer(server) {
       console.log('[Order Tool Count]', submitOrderCount);
       if (lastSubmitOrderPayload) {
         console.log('[Order Tool Payload @ End]', JSON.stringify(lastSubmitOrderPayload, null, 2));
+        try {
+          await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant);
+        } catch (err) {
+          console.error('[Firebase] order create wrapper failed', err);
+        }
       }
       if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
         openaiSocket.close();
@@ -475,4 +509,41 @@ function normalizeReason(reason) {
     return decoded || 'none';
   }
   return 'unknown';
+}
+
+async function submitOrderToFirebase(orderPayload, restaurant) {
+  try {
+    const restaurantId =
+      restaurant?.id || restaurant?.restaurantId || 'usFxbahxRibPEAWbVUAO';
+
+    const orderForFirestore = {
+      restaurantId,
+      restaurantName: restaurant?.name || "Joe's Pizza",
+      customerName: orderPayload.customerName || 'Unknown',
+      customerPhone: orderPayload.customerPhone || '',
+      fulfillmentType: orderPayload.fulfillmentType || 'pickup',
+      source: 'voice',
+      notes: orderPayload.notes || null,
+      items: (orderPayload.items || []).map((item) => ({
+        menuItemId: item.menuItemId || null,
+        name: item.name,
+        quantity: item.quantity || 1,
+        priceCents: item.priceCents || 0,
+        notes: item.notes || null,
+        specialInstructions: item.specialInstructions || null,
+        restaurantId,
+        source: 'voice',
+      })),
+      subtotalCents: orderPayload.subtotalCents || 0,
+      taxCents: orderPayload.taxCents || 0,
+      totalCents: orderPayload.totalCents || 0,
+      ticketSent: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const docRef = await db.collection('orders').add(orderForFirestore);
+    console.log('[Firebase] order created', docRef.id);
+  } catch (err) {
+    console.error('[Firebase] order create failed', err);
+  }
 }
