@@ -15,9 +15,9 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 const DEFAULT_RESTAURANT = {
-  id: 'usFxbahxRibPEAWbVUAO',
+  id: 'usFxbahxRibPEAWbIUAO',
   name: "Joe's Pizza",
-  restaurantId: 'usFxbahxRibPEAWbVUAO',
+  restaurantId: 'usFxbahxRibPEAWbIUAO',
   twilioNumber: '3475551234',
 };
 
@@ -54,6 +54,7 @@ export function attachRealtimeServer(server) {
     let functionCallId = null;
     let lastSubmitOrderPayload = null;
     let submitOrderCount = 0;
+    let orderSubmitted = false;
     let assistantTextBuffer = '';
     const orderLog = [];
 
@@ -190,11 +191,6 @@ export function attachRealtimeServer(server) {
                 }
               }
 
-              try {
-                await submitOrderToFirebase(payload, currentRestaurant);
-              } catch (err) {
-                console.error('[Firebase] order create wrapper failed', err);
-              }
             } catch (err) {
               console.warn('[Order Tool Payload] failed to parse arguments', err);
             }
@@ -280,10 +276,16 @@ export function attachRealtimeServer(server) {
         `[Realtime] Twilio stream closed${callSid ? ` (CallSid=${callSid})` : ''}: code=${code} reason=${reasonText}`
       );
       console.log('[Order Tool Count]', submitOrderCount);
-      if (lastSubmitOrderPayload) {
+      if (lastSubmitOrderPayload && !orderSubmitted) {
         console.log('[Order Tool Payload @ End]', JSON.stringify(lastSubmitOrderPayload, null, 2));
         try {
+          console.log('[Order] Writing order to Firestore once', {
+            customerName: lastSubmitOrderPayload.customerName,
+            customerPhone: lastSubmitOrderPayload.customerPhone,
+            fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
+          });
           await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant);
+          orderSubmitted = true;
         } catch (err) {
           console.error('[Firebase] order create wrapper failed', err);
         }
@@ -514,7 +516,7 @@ function normalizeReason(reason) {
 async function submitOrderToFirebase(orderPayload, restaurant) {
   try {
     const restaurantId =
-      restaurant?.id || restaurant?.restaurantId || 'usFxbahxRibPEAWbVUAO';
+      restaurant?.id || restaurant?.restaurantId || 'usFxbahxRibPEAWbIUAO';
 
     const orderForFirestore = {
       restaurantId,
