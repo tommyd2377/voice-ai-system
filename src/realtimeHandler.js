@@ -14,13 +14,6 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-const DEFAULT_RESTAURANT = {
-  id: 'usFxbahxRibPEAWbIUAO',
-  name: "Joe's Pizza",
-  restaurantId: 'usFxbahxRibPEAWbIUAO',
-  twilioNumber: '3475551234',
-};
-
 const DEFAULT_REALTIME_ENDPOINT =
   process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime';
 
@@ -36,7 +29,47 @@ export function attachRealtimeServer(server) {
     console.log('Twilio stream connected');
     console.log(`[Realtime] Twilio stream connected${callSid ? ` for CallSid=${callSid}` : ''}`);
 
-    const currentRestaurant = DEFAULT_RESTAURANT;
+    let currentRestaurant = null;
+
+    const loadRestaurantById = async (restaurantIdParam) => {
+      if (!restaurantIdParam) {
+        return null;
+      }
+      try {
+        const snap = await db.collection('restaurants').doc(restaurantIdParam).get();
+        if (!snap.exists) {
+          console.error('[Realtime] restaurantId not found in Firestore', {
+            restaurantId: restaurantIdParam,
+          });
+          return null;
+        }
+
+        currentRestaurant = { id: snap.id, restaurantId: snap.id, ...snap.data() };
+        console.log('[Realtime] restaurant loaded for call', {
+          restaurantId: snap.id,
+          name: currentRestaurant.name,
+        });
+        return currentRestaurant;
+      } catch (err) {
+        console.error('[Realtime] failed to fetch restaurant for connection', err);
+        return null;
+      }
+    };
+
+    let restaurantReady = (async () => {
+      try {
+        const requestUrl = new URL(request.url, 'http://localhost');
+        const restaurantIdParam = requestUrl.searchParams.get('restaurantId');
+        if (restaurantIdParam) {
+          return await loadRestaurantById(restaurantIdParam);
+        }
+        console.warn('[Realtime] no restaurantId query param on WebSocket connection; waiting for start event');
+        return null;
+      } catch (err) {
+        console.error('[Realtime] failed to parse connection URL for restaurantId', err);
+        return null;
+      }
+    })();
 
     const openaiSocket = connectToOpenAI();
     if (!openaiSocket) {
@@ -68,7 +101,6 @@ export function attachRealtimeServer(server) {
         if (event === 'media' && message.media) {
           const seq = message.sequenceNumber ?? message.media.sequenceNumber;
           const chunk = message.media.chunk ? message.media.chunk : message.media.chunkNumber;
-          console.log(`[Realtime] event=media seq=${seq} chunk=${chunk}`);
 
           if (message.media.payload && openaiSocket.readyState === WebSocket.OPEN) {
             const payload = message.media.payload;
@@ -82,6 +114,12 @@ export function attachRealtimeServer(server) {
           const sid = message.start.callSid || callSid || 'unknown';
           streamSid = message.start.streamSid || streamSid;
           console.log(`[Realtime] event=start callSid=${sid}`);
+          if (!currentRestaurant && message.start.customParameters && message.start.customParameters.restaurantId) {
+            const rid = message.start.customParameters.restaurantId;
+            restaurantReady = loadRestaurantById(rid).then(() => {
+              console.log('[Realtime] restaurant loaded from start.customParameters', { restaurantId: rid });
+            });
+          }
         } else if (event === 'mark' && message.mark) {
           const name = message.mark.name || 'unknown';
           console.log(`[Realtime] event=mark name=${name}`);
@@ -167,10 +205,14 @@ export function attachRealtimeServer(server) {
             (message.arguments || (message.delta && message.delta.arguments) || '') + functionCallBuffer;
           if (doneName === 'submit_order' && finalArgs) {
             try {
+              await restaurantReady;
               const payload = JSON.parse(finalArgs);
               lastSubmitOrderPayload = payload;
               submitOrderCount += 1;
               console.log('[Order Tool Payload]', JSON.stringify(payload, null, 2));
+              if (!currentRestaurant) {
+                console.error('[Order Tool Payload] missing restaurant context; skipping Firestore write');
+              }
 
               // Send tool output back to the model so it can continue speaking.
               if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
@@ -178,7 +220,6 @@ export function attachRealtimeServer(server) {
                   type: 'conversation.item.create',
                   item: {
                     type: 'function_call_output',
-                    role: 'assistant',
                     call_id: functionCallId,
                     output: JSON.stringify(payload),
                   },
@@ -276,20 +317,25 @@ export function attachRealtimeServer(server) {
         `[Realtime] Twilio stream closed${callSid ? ` (CallSid=${callSid})` : ''}: code=${code} reason=${reasonText}`
       );
       console.log('[Order Tool Count]', submitOrderCount);
-      if (lastSubmitOrderPayload && !orderSubmitted) {
-        console.log('[Order Tool Payload @ End]', JSON.stringify(lastSubmitOrderPayload, null, 2));
-        try {
-          console.log('[Order] Writing order to Firestore once', {
-            customerName: lastSubmitOrderPayload.customerName,
-            customerPhone: lastSubmitOrderPayload.customerPhone,
-            fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
-          });
-          await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant);
-          orderSubmitted = true;
-        } catch (err) {
-          console.error('[Firebase] order create wrapper failed', err);
+        if (lastSubmitOrderPayload && !orderSubmitted) {
+          await restaurantReady;
+          console.log('[Order Tool Payload @ End]', JSON.stringify(lastSubmitOrderPayload, null, 2));
+          try {
+            console.log('[Order] Writing order to Firestore once', {
+              customerName: lastSubmitOrderPayload.customerName,
+              customerPhone: lastSubmitOrderPayload.customerPhone,
+              fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
+            });
+            if (currentRestaurant) {
+              await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant);
+              orderSubmitted = true;
+            } else {
+              console.error('[Order] missing restaurant context at call end; skipping Firestore write');
+            }
+          } catch (err) {
+            console.error('[Firebase] order create wrapper failed', err);
+          }
         }
-      }
       if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
         openaiSocket.close();
       }
@@ -515,8 +561,11 @@ function normalizeReason(reason) {
 
 async function submitOrderToFirebase(orderPayload, restaurant) {
   try {
-    const restaurantId =
-      restaurant?.id || restaurant?.restaurantId || 'usFxbahxRibPEAWbIUAO';
+    const restaurantId = restaurant?.id || restaurant?.restaurantId;
+    if (!restaurantId) {
+      console.error('[Firebase] missing restaurantId; not writing order');
+      return;
+    }
 
     const orderForFirestore = {
       restaurantId,
