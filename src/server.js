@@ -6,7 +6,20 @@ import { attachRealtimeServer } from './realtimeHandler.js';
 
 const require = createRequire(import.meta.url);
 const admin = require('firebase-admin');
-const serviceAccount = require('../serviceAccountKey.json');
+
+let serviceAccount;
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+  // Hosted (Railway, etc): JSON string from env var
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  console.log('[Firebase] Using service account from FIREBASE_SERVICE_ACCOUNT_JSON env var');
+} else {
+  // Local dev: use the ignored file
+  // Make sure serviceAccountKey.json exists locally and is in .gitignore
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  serviceAccount = require('../serviceAccountKey.json');
+  console.log('[Firebase] Using local serviceAccountKey.json');
+}
 
 if (!admin.apps.length) {
   admin.initializeApp({
