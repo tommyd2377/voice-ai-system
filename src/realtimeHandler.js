@@ -1,271 +1,98 @@
 import WebSocket, { WebSocketServer } from 'ws';
-import { admin, db } from './firebase.js';
-import { resolveOrderPricing } from './menu/resolveOrderPricing.js';
+import twilio from 'twilio';
+
 const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
+const ASSISTANT_GREETING = "Hi, I'm Victoria. This is Thomas DeVito's personal AI assistant. How can I help you?";
+
 const BASE_INSTRUCTIONS = `
 You are Victoria, the personal AI assistant for Thomas DeVito.
-After your introduction, you will refer to him as Tom.
+After your introduction, always refer to him as Tom.
 
-You answer incoming phone calls to his public number and represent him professionally, intelligently, and engagingly.
-
-Your purpose is to help callers understand who Tom is, what he does, what he builds, and whether they should work with or contact him.
-
-You are not a generic chatbot.
-You are effectively his knowledgeable operator and representative.
-
-⸻
-
-CALL OPENING (DO THIS ONCE)
-
-Say exactly:
-
-“Hi, I’m Victoria. This is Thomas DeVito’s personal AI assistant. How can I help you?”
-
+Start every call by saying exactly:
+"${ASSISTANT_GREETING}"
 Then stop and wait.
 
-After this point, always refer to him as Tom.
+You handle two call types:
+1) caller_message: external callers who want to send Tom a message.
+2) self_note: Tom calling to leave himself a note.
 
-⸻
+For caller_message mode:
+- Collect name, reason for calling, message details, and at least one contact method if possible.
+- Ask whether they want a callback.
+- Before sending, read back a concise summary and ask for confirmation.
 
-PERSONALITY & CONVERSATIONAL STYLE
+For self_note mode:
+- Capture the note quickly in plain language.
+- Read back a short summary and ask for confirmation.
 
-Victoria speaks like a sharp, observant human assistant who genuinely knows the person she represents.
+When confirmed, call capture_message exactly once with structured fields.
+After tool output:
+- If delivered=true, say the message was passed along.
+- If delivered=false, say delivery may be delayed.
 
-You may:
-	•	be witty
-	•	be lightly sarcastic
-	•	be charming
-	•	be confident
-	•	use humor occasionally
+Style:
+- Sound professional, clear, and concise.
+- Be personable but do not be theatrical.
+- Do not fabricate facts about Tom.
 
-But you must NOT:
-	•	sound childish
-	•	act like a comedian
-	•	insult the caller
-	•	oversell unrealistically
-	•	brag without substance
-
-The caller should feel they are speaking to a clever human gatekeeper.
-
-You are allowed to give longer explanations when asked about his work, but:
-	•	break information into conversational chunks
-	•	pause conceptually between ideas
-	•	do not deliver lecture-length monologues unless the caller clearly asks for depth
-
-⸻
-
-CORE DESCRIPTION OF TOM (DEFAULT SUMMARY)
-
-When a caller asks “Who is Tom?” or similar, explain that:
-
-Tom is a full-stack software engineer and systems builder who works across web applications, blockchain infrastructure, and real-time interactive systems. He focuses on technically difficult projects and enjoys solving problems involving behavior, incentives, and automation.
-
-He is known for quickly learning new frameworks and building complex working products rather than just prototypes  ￼.
-
-⸻
-
-WHAT YOU CAN DISCUSS ABOUT HIM
-
-You may talk about:
-
-Software Engineering
-	•	Full-stack web development
-	•	Complex web applications
-	•	APIs and backend systems
-	•	real-time systems
-	•	database design
-	•	algorithmic logic
-
-Technologies he works with
-
-(only mention as relevant to the caller)
-
-TypeScript, JavaScript, Python, Rust, Ruby, Node.js, React, Angular, Vue, SQL, Postgres, Firebase, and Stripe integrations  ￼.
-
-He also works with blockchain and smart contracts, especially Solana and Anchor  ￼.
-
-Example Projects
-
-You may describe:
-
-• NFT and blockchain applications
-• a PvP AMM smart contract
-• multisig wallet smart contracts
-• a social news platform he built
-• technical systems involving real-time communication and automation  ￼.
-
-Do not fabricate employers or claim FAANG employment.
-
-⸻
-
-HOW TO ANSWER QUESTIONS
-
-Use a layered explanation approach:
-
-First: simple explanation
-Second: detail if they show interest
-Third: technical depth if requested
-
-After explaining, invite continuation:
-
-“Want the technical version or the normal human explanation?”
-
-⸻
-
-HOW TO HANDLE DIFFERENT CALLERS
-
-If they seem technical → include architecture and technologies.
-
-If they seem non-technical → explain what he builds in plain language.
-
-If they may be hiring → emphasize:
-	•	reliability
-	•	ability to learn quickly
-	•	ability to complete complex projects independently
-	•	breadth across frontend and backend.
-
-⸻
-
-CONTACT REQUESTS
-
-If a caller wants to reach Tom, collect:
-	•	their name
-	•	why they’re calling
-	•	email (preferred)
-
-Then say:
-
-“I’ll make sure Tom receives that.”
-
-Never promise a timeline.
-
-⸻
-
-RESTRICTIONS
-
-Do NOT discuss:
-	•	finances
-	•	housing
-	•	benefits
-	•	private personal life
-	•	relationships
-	•	political opinions
-
-Do not give his phone number or address.
-
-Do not claim you schedule his calendar.
-
-⸻
-
-OUT OF SCOPE
-
-If someone asks for unrelated services, respond:
-
-“I’m really just here to talk about Tom and his work, but I can pass along a message if you’d like.”
-
-⸻
-
-ENDING THE CALL
-
-When conversation naturally ends:
-
-“Thanks for calling. I’ll pass that along to Tom. Have a great day.”
+Restrictions:
+- Do not discuss private personal details.
+- Do not promise response timelines.
+- Do not claim calendar access.
 `.trim();
 
 const DEFAULT_REALTIME_ENDPOINT =
   process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime-mini';
 const DEFAULT_MODEL = 'gpt-realtime-mini';
-const DEFAULT_RESTAURANT_NAME = 'the restaurant';
-const DEFAULT_RESTAURANT_DESCRIPTION = 'neighborhood restaurant and takeout spot';
-const RESOLVE_ORDER_PRICING_TOOL = {
+
+const CAPTURE_MESSAGE_TOOL = {
   type: 'function',
-  name: 'resolve_order_pricing',
-  description: 'Resolve menu items and compute pricing for a draft order.',
+  name: 'capture_message',
+  description: 'Capture a caller message or self-note and dispatch it to Tom via SMS.',
   parameters: {
     type: 'object',
     properties: {
-      restaurantId: { type: 'string' },
-      fulfillmentType: { type: 'string', enum: ['pickup', 'delivery'] },
-      deliveryAddress: { type: 'string', nullable: true },
-      deliveryApt: { type: 'string', nullable: true },
-      deliveryNotes: { type: 'string', nullable: true },
-      items: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            name: { type: 'string' },
-            quantity: { type: 'number' },
-            notes: { type: 'string' },
-          },
-          required: ['name', 'quantity'],
-          additionalProperties: false,
-        },
+      mode: {
+        type: 'string',
+        enum: ['caller_message', 'self_note'],
+        description: 'Message type. Use self_note when Tom is calling himself.',
+      },
+      callerName: {
+        type: 'string',
+        nullable: true,
+        description: 'Caller name. Nullable for self_note mode.',
+      },
+      contactPhone: {
+        type: 'string',
+        nullable: true,
+        description: 'Best callback phone number, if available.',
+      },
+      contactEmail: {
+        type: 'string',
+        nullable: true,
+        description: 'Best callback email, if available.',
+      },
+      subject: {
+        type: 'string',
+        description: 'Short subject line for the message.',
+      },
+      messageBody: {
+        type: 'string',
+        description: 'Main message content in the caller\'s own intent.',
+      },
+      callbackRequested: {
+        type: 'boolean',
+        description: 'Whether the caller asked Tom to call back.',
+      },
+      priority: {
+        type: 'string',
+        enum: ['low', 'normal', 'high'],
+        description: 'Estimated urgency.',
       },
     },
-    required: ['restaurantId', 'fulfillmentType', 'items'],
+    required: ['mode', 'subject', 'messageBody', 'callbackRequested', 'priority'],
     additionalProperties: false,
   },
-};
-const SUBMIT_ORDER_TOOL = {
-  type: 'function',
-  name: 'submit_order',
-  description: 'Submit a confirmed order from this phone call.',
-  parameters: {
-    type: 'object',
-    properties: {
-      customerName: { type: 'string' },
-      customerPhone: { type: 'string' },
-      fulfillmentType: { type: 'string', enum: ['pickup', 'delivery'] },
-      deliveryAddress: {
-        type: 'string',
-        description: 'Full delivery street address including number and street name.',
-      },
-      deliveryApt: {
-        type: 'string',
-        description: 'Apartment, unit, or floor, if applicable.',
-        nullable: true,
-      },
-      deliveryNotes: {
-        type: 'string',
-        description: 'Extra delivery notes or landmark info.',
-        nullable: true,
-      },
-      items: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            name: { type: 'string' },
-            quantity: { type: 'number' },
-            notes: { type: 'string' },
-          },
-          required: ['name', 'quantity'],
-          additionalProperties: false,
-        },
-      },
-      notes: { type: 'string' },
-    },
-    required: ['customerName', 'customerPhone', 'fulfillmentType', 'items'],
-    additionalProperties: false,
-  },
-};
-
-const buildInstructions = (restaurant, { hasDefaultPhone = false } = {}) => {
-  const restaurantName = restaurant?.name || DEFAULT_RESTAURANT_NAME;
-  const description = (restaurant?.shortDescription || DEFAULT_RESTAURANT_DESCRIPTION).trim();
-
-  let instructions = BASE_INSTRUCTIONS.replaceAll('{{RESTAURANT_NAME}}', restaurantName).replaceAll(
-    '{{RESTAURANT_DESCRIPTION}}',
-    description
-  );
-
-  if (hasDefaultPhone) {
-    instructions +=
-      '\nPHONE NUMBER: Caller phone is known from caller ID. NEVER ask for the phone number during the call. Only include the phone number in the single final confirmation.';
-  }
-
-  return instructions;
 };
 
 const INVALID_PHONE_VALUES = new Set([
@@ -281,7 +108,7 @@ const INVALID_PHONE_VALUES = new Set([
   'caller',
 ]);
 
-const cleanCustomerPhone = (value) => {
+const normalizeCallerPhone = (value) => {
   if (value == null) return null;
   const trimmed = String(value).trim();
   if (!trimmed) return null;
@@ -289,13 +116,137 @@ const cleanCustomerPhone = (value) => {
   return trimmed;
 };
 
-const applyCustomerPhoneFallback = (payload, fallbackPhone) => {
-  const sanitized = { ...payload };
-  const normalizedPayloadPhone = cleanCustomerPhone(sanitized.customerPhone);
-  const normalizedFallback = cleanCustomerPhone(fallbackPhone);
-  sanitized.customerPhone = normalizedPayloadPhone || normalizedFallback || null;
-  return sanitized;
+const normalizeEmail = (value) => {
+  if (value == null) return null;
+  const trimmed = String(value).trim();
+  if (!trimmed) return null;
+  if (!trimmed.includes('@')) return null;
+  return trimmed;
 };
+
+const normalizeMode = (value, fallback) => {
+  if (value === 'caller_message' || value === 'self_note') {
+    return value;
+  }
+  return fallback;
+};
+
+const normalizePriority = (value) => {
+  if (value === 'low' || value === 'normal' || value === 'high') {
+    return value;
+  }
+  return 'normal';
+};
+
+const normalizeBoolean = (value, fallback = false) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const lower = value.toLowerCase();
+    if (lower === 'true' || lower === 'yes') return true;
+    if (lower === 'false' || lower === 'no') return false;
+  }
+  return fallback;
+};
+
+const sanitizeText = (value, maxLength = 500) => {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  return text.slice(0, maxLength);
+};
+
+const digitsOnly = (value) => String(value || '').replace(/\D/g, '');
+
+const areSamePhone = (a, b) => {
+  const da = digitsOnly(a);
+  const db = digitsOnly(b);
+  if (!da || !db) return false;
+  if (da.length >= 10 && db.length >= 10) {
+    return da.slice(-10) === db.slice(-10);
+  }
+  return da === db;
+};
+
+const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}) => {
+  let instructions = BASE_INSTRUCTIONS;
+
+  if (isSelfCaller) {
+    instructions +=
+      '\nCALL CONTEXT: Caller ID matches Tom\'s number. Default to self_note mode unless caller explicitly says otherwise.';
+  } else {
+    instructions += '\nCALL CONTEXT: Treat this caller as an external contact unless clarified otherwise.';
+  }
+
+  if (hasCallerPhone) {
+    instructions +=
+      '\nPHONE CONTEXT: Caller phone is available from caller ID. Use it as fallback contactPhone if none is provided.';
+  }
+
+  return instructions;
+};
+
+const formatOutboundMessage = (payload, meta = {}) => {
+  const lines = [
+    'Voice Assistant Message',
+    `Mode: ${payload.mode}`,
+    `Priority: ${payload.priority}`,
+    `Callback requested: ${payload.callbackRequested ? 'yes' : 'no'}`,
+    `Subject: ${payload.subject}`,
+    `Message: ${payload.messageBody}`,
+  ];
+
+  if (payload.callerName) lines.push(`Caller name: ${payload.callerName}`);
+  if (payload.contactPhone) lines.push(`Contact phone: ${payload.contactPhone}`);
+  if (payload.contactEmail) lines.push(`Contact email: ${payload.contactEmail}`);
+  if (meta.callerPhone) lines.push(`Caller ID: ${meta.callerPhone}`);
+  if (meta.callSid) lines.push(`CallSid: ${meta.callSid}`);
+  if (meta.isSelfCaller != null) lines.push(`Self caller detected: ${meta.isSelfCaller ? 'yes' : 'no'}`);
+  if (meta.createdAt) lines.push(`Captured at: ${meta.createdAt}`);
+
+  return lines.join('\n');
+};
+
+// Firebase re-entry notes:
+// - Re-enable persistence by adding a storage adapter (for example Firestore) behind a single dispatch interface.
+// - Keep capture_message payload shape stable so storage and SMS can coexist without prompt/schema changes.
+// - If reactivating Firebase later, wire it via a separate module and call it from handleCaptureMessage.
+
+async function sendSmsToOwner(messageBody) {
+  const ownerPhone = normalizeCallerPhone(process.env.TWILIO_OWNER_PHONE);
+  const smsFrom = normalizeCallerPhone(process.env.TWILIO_SMS_FROM || process.env.PHONE_RELAY_NUMBER);
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+  if (!ownerPhone) {
+    return { delivered: false, channel: 'sms', reason: 'TWILIO_OWNER_PHONE missing' };
+  }
+  if (!smsFrom) {
+    return { delivered: false, channel: 'sms', reason: 'TWILIO_SMS_FROM missing' };
+  }
+  if (!accountSid || !authToken) {
+    return { delivered: false, channel: 'sms', reason: 'Twilio account credentials missing' };
+  }
+
+  try {
+    const client = twilio(accountSid, authToken);
+    const sms = await client.messages.create({
+      to: ownerPhone,
+      from: smsFrom,
+      body: messageBody,
+    });
+
+    return {
+      delivered: true,
+      channel: 'sms',
+      messageSid: sms.sid,
+      to: ownerPhone,
+      from: smsFrom,
+    };
+  } catch (err) {
+    console.error('[SMS] failed to send to owner', err);
+    return { delivered: false, channel: 'sms', reason: 'Twilio SMS send failed' };
+  }
+}
 
 export function attachRealtimeServer(server) {
   const wss = new WebSocketServer({ server, path: '/realtime' });
@@ -305,51 +256,9 @@ export function attachRealtimeServer(server) {
   });
 
   wss.on('connection', (socket, request) => {
-    const callSid = request.headers['x-twilio-call-sid'];
+    const callSid = request.headers['x-twilio-call-sid'] || null;
     console.log('Twilio stream connected');
     console.log(`[Realtime] Twilio stream connected${callSid ? ` for CallSid=${callSid}` : ''}`);
-
-    let currentRestaurant = null;
-
-    const loadRestaurantById = async (restaurantIdParam) => {
-      if (!restaurantIdParam) {
-        return null;
-      }
-      try {
-        const snap = await db.collection('restaurants').doc(restaurantIdParam).get();
-        if (!snap.exists) {
-          console.error('[Realtime] restaurantId not found in Firestore', {
-            restaurantId: restaurantIdParam,
-          });
-          return null;
-        }
-
-        currentRestaurant = { id: snap.id, restaurantId: snap.id, ...snap.data() };
-        console.log('[Realtime] restaurant loaded for call', {
-          restaurantId: snap.id,
-          name: currentRestaurant.name,
-        });
-        return currentRestaurant;
-      } catch (err) {
-        console.error('[Realtime] failed to fetch restaurant for connection', err);
-        return null;
-      }
-    };
-
-    let restaurantReady = (async () => {
-      try {
-        const requestUrl = new URL(request.url, 'http://localhost');
-        const restaurantIdParam = requestUrl.searchParams.get('restaurantId');
-        if (restaurantIdParam) {
-          return await loadRestaurantById(restaurantIdParam);
-        }
-        console.warn('[Realtime] no restaurantId query param on WebSocket connection; waiting for start event');
-        return null;
-      } catch (err) {
-        console.error('[Realtime] failed to parse connection URL for restaurantId', err);
-        return null;
-      }
-    })();
 
     const openaiSocket = connectToOpenAI();
     if (!openaiSocket) {
@@ -365,11 +274,10 @@ export function attachRealtimeServer(server) {
     let functionCallBuffer = '';
     let functionCallName = null;
     let functionCallId = null;
-    let lastSubmitOrderPayload = null;
-    let lastResolvedPricing = null;
-    let submitOrderCount = 0;
-    let orderSubmitted = false;
-    let inferredCustomerPhone = null;
+    let inferredCallerPhone = null;
+    let isSelfCaller = false;
+    let lastCapturedMessage = null;
+    let messageDispatchStatus = null;
     let callStartMs = Date.now();
     let callEndMs = null;
     let openaiReady = false;
@@ -384,6 +292,11 @@ export function attachRealtimeServer(server) {
       output_audio_tokens: 0,
       model_requests: 0,
     };
+
+    const ownerPhone = normalizeCallerPhone(process.env.TWILIO_OWNER_PHONE);
+    if (!ownerPhone) {
+      console.warn('[Realtime] TWILIO_OWNER_PHONE is not set; SMS delivery will fail until configured');
+    }
 
     const resetFunctionCallState = () => {
       functionCallBuffer = '';
@@ -449,106 +362,6 @@ export function attachRealtimeServer(server) {
       cancelActiveResponse();
     };
 
-    const handleFunctionCallDone = async () => {
-      if (!functionCallName || !functionCallBuffer) {
-        resetFunctionCallState();
-        return;
-      }
-
-      try {
-        await restaurantReady;
-        const parsedArgs = JSON.parse(functionCallBuffer);
-
-        if (functionCallName === 'resolve_order_pricing') {
-          try {
-            const restaurantDocId =
-              currentRestaurant?.id || currentRestaurant?.restaurantId || parsedArgs.restaurantId;
-            const resolved = await resolveOrderPricing({
-              ...parsedArgs,
-              restaurantId: restaurantDocId,
-            });
-            lastResolvedPricing = resolved;
-            if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
-              const toolOutput = {
-                type: 'conversation.item.create',
-                item: {
-                  type: 'function_call_output',
-                  call_id: functionCallId,
-                  output: JSON.stringify(resolved),
-                },
-              };
-              openaiSocket.send(JSON.stringify(toolOutput));
-              forceResponse(
-                'Use the pricing results to perform the single final confirmation. If unmatched items exist, ask one clarifying question with up to two suggestions; otherwise give the concise final summary with totals and ask "Is everything correct?" Do not call submit_order until the caller confirms yes.'
-              );
-            }
-          } catch (err) {
-            console.error('[Pricing] resolve_order_pricing failed', err);
-          }
-          resetFunctionCallState();
-          return;
-        }
-
-        if (functionCallName === 'submit_order') {
-          const sanitizedPayload = applyCustomerPhoneFallback(parsedArgs, inferredCustomerPhone);
-          const pricingMatchesRestaurant =
-            lastResolvedPricing &&
-            lastResolvedPricing.restaurantId &&
-            (lastResolvedPricing.restaurantId === currentRestaurant?.id ||
-              lastResolvedPricing.restaurantId === currentRestaurant?.restaurantId ||
-              lastResolvedPricing.restaurantId === parsedArgs.restaurantId);
-
-          if (pricingMatchesRestaurant && lastResolvedPricing) {
-            sanitizedPayload.items = (lastResolvedPricing.resolvedItems || []).map((item) => ({
-              menuItemId: item.menuItemId || null,
-              name: item.name,
-              quantity: item.quantity || 1,
-              priceCents: item.priceCents ?? 0,
-              notes: item.notes || null,
-              specialInstructions: null,
-            }));
-            sanitizedPayload.subtotalCents =
-              lastResolvedPricing.subtotalCents ?? sanitizedPayload.subtotalCents ?? 0;
-            sanitizedPayload.taxCents =
-              lastResolvedPricing.taxCents ?? sanitizedPayload.taxCents ?? null;
-            sanitizedPayload.totalCents =
-              lastResolvedPricing.totalCents ??
-              (sanitizedPayload.subtotalCents || 0) + (sanitizedPayload.taxCents || 0);
-          }
-
-          lastSubmitOrderPayload = sanitizedPayload;
-          submitOrderCount += 1;
-          console.log('[Order Tool Payload]', JSON.stringify(sanitizedPayload, null, 2));
-          if (!currentRestaurant) {
-            console.error('[Order Tool Payload] missing restaurant context; skipping Firestore write');
-          }
-
-          if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
-            const toolOutput = {
-              type: 'conversation.item.create',
-              item: {
-                type: 'function_call_output',
-                call_id: functionCallId,
-                output: JSON.stringify(sanitizedPayload),
-              },
-            };
-            try {
-              openaiSocket.send(JSON.stringify(toolOutput));
-              forceResponse('Order received.');
-            } catch (err) {
-              console.warn('[Order Tool Payload] failed to send tool output', err);
-            }
-          }
-          resetFunctionCallState();
-          return;
-        }
-      } catch (err) {
-        console.warn('[Function Call] failed to process arguments', err);
-      }
-
-      resetFunctionCallState();
-    };
-
     const forwardAudioToTwilio = (audioChunk) => {
       if (!streamSid || userSpeaking || !activeResponse) {
         return;
@@ -580,11 +393,9 @@ export function attachRealtimeServer(server) {
 
     const maybeInitSession = async () => {
       if (sessionInitialized || !openaiReady || !twilioStartReceived) return;
-      await restaurantReady;
 
-      const hasDefaultPhone = Boolean(cleanCustomerPhone(inferredCustomerPhone));
-      const instructions = buildInstructions(currentRestaurant, { hasDefaultPhone });
-      const restaurantName = currentRestaurant?.name || DEFAULT_RESTAURANT_NAME;
+      const hasCallerPhone = Boolean(normalizeCallerPhone(inferredCallerPhone));
+      const instructions = buildInstructions({ isSelfCaller, hasCallerPhone });
 
       if (openaiSocket.readyState !== WebSocket.OPEN) {
         return;
@@ -597,27 +408,131 @@ export function attachRealtimeServer(server) {
             type: 'realtime',
             model: DEFAULT_MODEL,
             instructions,
+            tools: [CAPTURE_MESSAGE_TOOL],
           },
         })
       );
 
-      const greetingText = `Thanks for calling ${restaurantName}. How can I help you?`;
       openaiSocket.send(
         JSON.stringify({
           type: 'response.create',
           response: {
-            instructions: `Start the call by saying exactly: Hi, I’m Victoria. This is Thomas DeVito’s personal AI assistant. How can I help you?`,
+            instructions: `Start the call by saying exactly: ${ASSISTANT_GREETING}`,
           },
         })
       );
 
       sessionInitialized = true;
-      const phoneLast4 = cleanCustomerPhone(inferredCustomerPhone)?.slice(-4) || null;
+      const phoneLast4 = normalizeCallerPhone(inferredCallerPhone)?.slice(-4) || null;
       console.log('[Realtime] session initialized', {
-        restaurantId: currentRestaurant?.id || currentRestaurant?.restaurantId || null,
-        hasDefaultPhone,
+        callSid,
+        hasCallerPhone,
         callerPhoneLast4: phoneLast4,
+        isSelfCaller,
       });
+    };
+
+    const handleCaptureMessage = async (parsedArgs) => {
+      const fallbackMode = isSelfCaller ? 'self_note' : 'caller_message';
+      const mode = normalizeMode(parsedArgs?.mode, fallbackMode);
+      const callerName = sanitizeText(parsedArgs?.callerName, 80);
+      const contactPhone =
+        normalizeCallerPhone(parsedArgs?.contactPhone) || normalizeCallerPhone(inferredCallerPhone) || null;
+      const contactEmail = normalizeEmail(parsedArgs?.contactEmail);
+      const subject = sanitizeText(parsedArgs?.subject, 160) || (mode === 'self_note' ? 'Self note' : 'Voice message');
+      const messageBody = sanitizeText(parsedArgs?.messageBody, 2000);
+      const callbackRequested = normalizeBoolean(parsedArgs?.callbackRequested, false);
+      const priority = normalizePriority(parsedArgs?.priority);
+
+      if (!messageBody) {
+        forceResponse('Please restate the message in one or two clear sentences.');
+        return;
+      }
+
+      const payload = {
+        mode,
+        callerName,
+        contactPhone,
+        contactEmail,
+        subject,
+        messageBody,
+        callbackRequested,
+        priority,
+      };
+
+      lastCapturedMessage = payload;
+
+      const smsBody = formatOutboundMessage(payload, {
+        callSid,
+        callerPhone: normalizeCallerPhone(inferredCallerPhone),
+        isSelfCaller,
+        createdAt: new Date().toISOString(),
+      });
+
+      const smsResult = await sendSmsToOwner(smsBody);
+      messageDispatchStatus = smsResult;
+
+      if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
+        const toolOutput = {
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: functionCallId,
+            output: JSON.stringify({
+              delivered: smsResult.delivered,
+              channel: 'sms',
+              reason: smsResult.reason || null,
+            }),
+          },
+        };
+
+        try {
+          openaiSocket.send(JSON.stringify(toolOutput));
+        } catch (err) {
+          console.warn('[capture_message] failed to send tool output', err);
+        }
+      }
+
+      if (smsResult.delivered) {
+        forceResponse('Thanks. I captured your message and passed it along to Tom.');
+      } else {
+        forceResponse('Thanks. I captured your message. Delivery may be delayed right now.');
+      }
+    };
+
+    const handleFunctionCallDone = async () => {
+      if (!functionCallName || !functionCallBuffer) {
+        resetFunctionCallState();
+        return;
+      }
+
+      try {
+        const parsedArgs = JSON.parse(functionCallBuffer);
+
+        if (functionCallName === 'capture_message') {
+          await handleCaptureMessage(parsedArgs);
+          resetFunctionCallState();
+          return;
+        }
+
+        if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
+          openaiSocket.send(
+            JSON.stringify({
+              type: 'conversation.item.create',
+              item: {
+                type: 'function_call_output',
+                call_id: functionCallId,
+                output: JSON.stringify({ delivered: false, channel: 'sms', reason: 'Unsupported tool name' }),
+              },
+            })
+          );
+        }
+      } catch (err) {
+        console.warn('[Function Call] failed to process arguments', err);
+        forceResponse('Sorry, I missed that. Please repeat your message in one short summary.');
+      }
+
+      resetFunctionCallState();
     };
 
     openaiSocket.on('open', () => {
@@ -654,14 +569,13 @@ export function attachRealtimeServer(server) {
             }
             streamSid = message.start?.streamSid || streamSid;
             if (message.start?.customParameters?.customerPhone) {
-              inferredCustomerPhone = String(message.start.customParameters.customerPhone).trim();
-              console.log('[Realtime] inferred customer phone', inferredCustomerPhone);
+              inferredCallerPhone = normalizeCallerPhone(message.start.customParameters.customerPhone);
             }
-            if (!currentRestaurant && message.start?.customParameters?.restaurantId) {
-              const rid = message.start.customParameters.restaurantId;
-              restaurantReady = loadRestaurantById(rid).then(() => {
-                console.log('[Realtime] restaurant loaded from start.customParameters', { restaurantId: rid });
-              });
+            if (ownerPhone && inferredCallerPhone) {
+              isSelfCaller = areSamePhone(inferredCallerPhone, ownerPhone);
+            }
+            if (inferredCallerPhone) {
+              console.log('[Realtime] inferred caller phone', inferredCallerPhone);
             }
             twilioStartReceived = true;
             maybeInitSession();
@@ -684,7 +598,7 @@ export function attachRealtimeServer(server) {
             }
         }
       } catch (err) {
-        console.warn('[Realtime] Failed to parse Twilio message as JSON');
+        console.warn('[Realtime] Failed to parse Twilio message as JSON', err?.message || err);
       }
     };
 
@@ -784,70 +698,31 @@ export function attachRealtimeServer(server) {
       }
     };
 
-    // Handle messages from OpenAI and forward audio deltas back to Twilio.
     openaiSocket.on('message', handleOpenAiMessage);
 
-    socket.on('close', async (code, reason) => {
+    socket.on('close', (code, reason) => {
       callEndMs = Date.now();
       const callDurationSeconds = Math.round((callEndMs - callStartMs) / 1000);
-      const analyticsPhone =
-        cleanCustomerPhone(lastSubmitOrderPayload?.customerPhone) || cleanCustomerPhone(inferredCustomerPhone) || null;
       const reasonText = normalizeReason(reason);
+      const callerPhone = normalizeCallerPhone(inferredCallerPhone);
+
       console.log('Twilio stream closed');
       console.log(
         `[Realtime] Twilio stream closed${callSid ? ` (CallSid=${callSid})` : ''}: code=${code} reason=${reasonText}`
       );
-      console.log('[Order Tool Count]', submitOrderCount);
-      const callAnalytics = {
-        callSid: callSid || null,
-        restaurantId: currentRestaurant?.id || null,
-        customerPhone: analyticsPhone,
-        callDurationSeconds,
-        openaiUsageTotals,
-        endedAt: new Date().toISOString(),
-      };
-      if (lastSubmitOrderPayload && !orderSubmitted) {
-        await restaurantReady;
-        console.log('[Order Tool Payload @ End]', JSON.stringify(lastSubmitOrderPayload, null, 2));
-        try {
-          console.log('[Order] Writing order to Firestore once', {
-            customerName: lastSubmitOrderPayload.customerName,
-            customerPhone: lastSubmitOrderPayload.customerPhone,
-            fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
-          });
-          if (currentRestaurant) {
-            await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant, {
-              callDurationSeconds,
-              openaiUsageTotals,
-            });
-            orderSubmitted = true;
-          } else {
-            console.error('[Order] missing restaurant context at call end; skipping Firestore write');
-          }
-        } catch (err) {
-          console.error('[Firebase] order create wrapper failed', err);
-        }
-      }
-      if (lastSubmitOrderPayload) {
-        console.log('[Call Summary]', {
-          restaurantId: currentRestaurant?.id || currentRestaurant?.restaurantId,
-          customerName: lastSubmitOrderPayload.customerName,
-          fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
-          itemCount: Array.isArray(lastSubmitOrderPayload.items) ? lastSubmitOrderPayload.items.length : 0,
-        });
-      } else {
-        try {
-          await db.collection('call_logs').add(callAnalytics);
-        } catch (err) {
-          console.error('[Firebase] failed to write call log', err);
-        }
-      }
-      console.log('[Call Analytics]', {
-        callSid: callSid || null,
-        customerPhone: analyticsPhone,
+
+      console.log('[Call Summary]', {
+        callSid,
+        callerPhone,
+        isSelfCaller,
+        capturedMode: lastCapturedMessage?.mode || null,
+        capturedSubject: lastCapturedMessage?.subject || null,
+        messageDelivered: messageDispatchStatus?.delivered || false,
+        deliveryReason: messageDispatchStatus?.reason || null,
         callDurationSeconds,
         openaiUsageTotals,
       });
+
       if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
         openaiSocket.close();
       }
@@ -879,7 +754,10 @@ export function connectToOpenAI() {
   ws.on('open', () => {
     console.log('[OpenAI] connected');
 
-    const fallbackInstructions = buildInstructions();
+    const fallbackInstructions = buildInstructions({
+      isSelfCaller: false,
+      hasCallerPhone: false,
+    });
 
     const sessionUpdate = {
       type: 'session.update',
@@ -908,7 +786,7 @@ export function connectToOpenAI() {
             voice: 'sage',
           },
         },
-        tools: [RESOLVE_ORDER_PRICING_TOOL, SUBMIT_ORDER_TOOL],
+        tools: [CAPTURE_MESSAGE_TOOL],
       },
     };
 
@@ -940,61 +818,4 @@ function normalizeReason(reason) {
     return decoded || 'none';
   }
   return 'unknown';
-}
-
-async function submitOrderToFirebase(orderPayload, restaurant, meta = {}) {
-  try {
-    const restaurantId = restaurant?.id || restaurant?.restaurantId;
-    if (!restaurantId) {
-      console.error('[Firebase] missing restaurantId; not writing order');
-      return;
-    }
-
-    const isDelivery = orderPayload.fulfillmentType === 'delivery';
-    const hasAddress = !!(orderPayload.deliveryAddress && orderPayload.deliveryAddress.trim());
-    if (isDelivery && !hasAddress) {
-      console.error('[Firebase] refusing to write delivery order without address', {
-        restaurantId,
-        customerName: orderPayload.customerName,
-        customerPhone: orderPayload.customerPhone,
-      });
-      return;
-    }
-
-    const orderForFirestore = {
-      restaurantId,
-      restaurantName: restaurant?.name || "Joe's Pizza",
-      customerName: orderPayload.customerName || 'Unknown',
-      customerPhone: orderPayload.customerPhone || '',
-      fulfillmentType: orderPayload.fulfillmentType || 'pickup',
-      deliveryAddress: orderPayload.deliveryAddress || null,
-      deliveryApt: orderPayload.deliveryApt || null,
-      deliveryNotes: orderPayload.deliveryNotes || null,
-      source: 'voice',
-      notes: orderPayload.notes || null,
-      callDurationSeconds: meta?.callDurationSeconds || null,
-      openaiUsageTotals: meta?.openaiUsageTotals || null,
-      items: (orderPayload.items || []).map((item) => ({
-        menuItemId: item.menuItemId || null,
-        name: item.name,
-        quantity: item.quantity || 1,
-        priceCents: item.priceCents || 0,
-        notes: item.notes || null,
-        specialInstructions: item.specialInstructions || null,
-        restaurantId,
-        source: 'voice',
-      })),
-      subtotalCents: orderPayload.subtotalCents || 0,
-      taxCents: orderPayload.taxCents || 0,
-      totalCents: orderPayload.totalCents || 0,
-      ticketSent: false,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      openaiUsageRecordedAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
-
-    const docRef = await db.collection('orders').add(orderForFirestore);
-    console.log('[Firebase] order created', docRef.id);
-  } catch (err) {
-    console.error('[Firebase] order create failed', err);
-  }
 }
