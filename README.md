@@ -1,4 +1,4 @@
-# GoLine Voice Order System (Day 1)
+# GoLine Voice AI System (Day 1)
 
 Day-1 MVP plumbing for the GoLine AI phone-order assistant.
 

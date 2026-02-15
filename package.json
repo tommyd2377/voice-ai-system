@@ -1,7 +1,7 @@
 {
-  "name": "voice-order-system",
+  "name": "voice-ai-system",
   "version": "0.1.0",
-  "description": "Day-1 MVP plumbing for the GoLine voice order system.",
+  "description": "Day-1 MVP plumbing for the GoLine voice AI system.",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
