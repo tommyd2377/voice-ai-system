@@ -606,7 +606,7 @@ export function attachRealtimeServer(server) {
         JSON.stringify({
           type: 'response.create',
           response: {
-            instructions: `Start the call by saying exactly: "${greetingText}" Then stop and wait for the caller's answer before saying anything else.`,
+            instructions: `Start the call by saying exactly: Hi, I’m Victoria. This is Thomas DeVito’s personal AI assistant. How can I help you?`,
           },
         })
       );
