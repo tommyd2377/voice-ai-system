@@ -33,7 +33,7 @@ and shipping complex working products.
 WORK HISTORY HIGHLIGHTS
 - Software Developer in Brooklyn, NYC (2018 to present), building complex software products and systems.
 - Former DoorDash manager for NYC personal shoppers (operations leadership across multiple locations).
-- Former Instacart elite personal shopper and operations liaison with retail management.
+- Former Instacart elite personal shopper and operations liaison with Zabar's management team.
 
 TECHNOLOGIES AND SKILLS
 Use these only when relevant to the caller:
