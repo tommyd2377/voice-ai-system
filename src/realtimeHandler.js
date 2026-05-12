@@ -59,7 +59,7 @@ SYSTEM SUMMARY
 - This is a Node.js backend voice assistant.
 - Twilio sends calls to POST /voice, where the server returns TwiML containing <Connect><Stream>.
 - Twilio then opens a live media WebSocket to /realtime.
-- The realtime bridge opens a second WebSocket to the OpenAI Realtime API (model gpt-realtime).
+- The realtime bridge opens a second WebSocket to the OpenAI Realtime API (model gpt-realtime-2).
 - Incoming caller audio is forwarded to OpenAI; assistant audio deltas are streamed back to Twilio in real time.
 - When a message is confirmed, a structured capture_message tool call is executed and the message is sent to Tom by SMS through Twilio.
 
@@ -300,18 +300,18 @@ When the conversation naturally ends, say:
 
 const configuredRealtimeEndpoint = process.env.OPENAI_REALTIME_ENDPOINT;
 const DEFAULT_REALTIME_ENDPOINT = (() => {
-  const fallback = 'wss://api.openai.com/v1/realtime?model=gpt-realtime';
+  const fallback = 'wss://api.openai.com/v1/realtime?model=gpt-realtime-2';
   if (!configuredRealtimeEndpoint) return fallback;
 
   try {
     const endpoint = new URL(configuredRealtimeEndpoint);
-    endpoint.searchParams.set('model', 'gpt-realtime');
+    endpoint.searchParams.set('model', 'gpt-realtime-2');
     return endpoint.toString();
   } catch {
     return fallback;
   }
 })();
-const DEFAULT_MODEL = 'gpt-realtime';
+const DEFAULT_MODEL = 'gpt-realtime-2';
 
 const CAPTURE_MESSAGE_TOOL = {
   type: 'function',

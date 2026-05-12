@@ -27,7 +27,7 @@ When the assistant confirms a message, it calls a single tool (`capture_message`
 - Twilio REST API for SMS delivery of captured messages
 
 ### AI and Speech
-- OpenAI Realtime API (`gpt-realtime`)
+- OpenAI Realtime API (`gpt-realtime-2`)
 - Realtime server VAD (`server_vad`) for turn detection and interruption behavior
 - OpenAI transcription model (`gpt-4o-transcribe`) for input audio transcription
 
@@ -56,7 +56,7 @@ flowchart LR
   C --> D[TwiML Connect Stream]
   D --> E[Twilio Media Stream WebSocket]
   E --> F[Realtime bridge in src/realtimeHandler.js]
-  F --> G[OpenAI Realtime API gpt-realtime]
+  F --> G[OpenAI Realtime API gpt-realtime-2]
   G --> F
   F --> E
   F --> H[Twilio SMS API]
@@ -79,7 +79,7 @@ flowchart LR
 ## Realtime Session Design
 
 `connectToOpenAI()` initializes realtime with:
-- Model: `gpt-realtime`
+- Model: `gpt-realtime-2`
 - Output audio modality with `audio/pcmu`
 - Input transcription: `gpt-4o-transcribe`
 - Turn detection: `server_vad`
@@ -128,7 +128,7 @@ Behavior notes:
 - `TWILIO_SMS_FROM` (or set `PHONE_RELAY_NUMBER` as fallback sender)
 
 ### Optional
-- `OPENAI_REALTIME_ENDPOINT` (runtime forces model query param to `gpt-realtime`)
+- `OPENAI_REALTIME_ENDPOINT` (runtime forces model query param to `gpt-realtime-2`)
 - `PHONE_RELAY_NUMBER`
 - `PORT` (default `8080`)
 - `VERBOSE_OPENAI_LOGS=true` for deeper event logs
