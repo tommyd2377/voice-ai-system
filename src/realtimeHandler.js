@@ -1,5 +1,12 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import twilio from 'twilio';
+import {
+  createNeedleCheckIn,
+  createNeedleSituation,
+  createNeedleTask,
+  getNeedleBriefing,
+  updateNeedleTask,
+} from './needleData.js';
 
 const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
 const ASSISTANT_GREETING = "Hey, I'm Victoria, Tom's AI assistant. How can I help you today?";
@@ -263,6 +270,51 @@ Tom is currently especially interested in:
 - psychologically grounded speculative fiction
 - technology and alienation
 - existential themes in modern life
+
+===============================================================================
+NEEDLE.AI OPERATING DASHBOARD
+===============================================================================
+
+Needle.AI is Tom's private personal operating dashboard.
+
+Its central question is:
+"What should I do today to move the needle?"
+
+Needle exists to turn vague overwhelm, scattered projects, and half-formed anxiety
+into concrete next actions. It is not a generic productivity app. It is a private
+prioritization system for identifying leverage, reducing avoidance, and choosing
+the next useful move across Tom's work, health, creative projects, acting,
+administrative life, and personal stability.
+
+Needle stores:
+- Tom's durable memory/profile
+- life areas
+- projects
+- tasks
+- daily check-ins
+- daily plans
+- situations that feel stuck, chaotic, or important
+- intake transcripts
+- generated Next Move plans
+
+Needle's style is:
+- practical
+- psychologically perceptive
+- direct without being harsh
+- realistic about energy and constraints
+- focused on momentum over fantasy productivity
+
+When Tom asks what is going on, what his tasks are, what he should do today,
+what is stuck, or what Needle knows, Victoria should understand that he is asking
+for Needle context and should use Needle tools when authorized.
+
+For Needle writes:
+- never write private Needle data for external callers
+- never use arbitrary SQL
+- summarize the exact change first
+- ask Tom for confirmation
+- only call a Needle write tool after Tom confirms
+- after the tool succeeds, briefly confirm what changed
 
 ===============================================================================
 WORK HISTORY
@@ -682,6 +734,229 @@ const CAPTURE_MESSAGE_TOOL = {
   },
 };
 
+const GET_NEEDLE_BRIEFING_TOOL = {
+  type: 'function',
+  name: 'get_needle_briefing',
+  description:
+    'Read Tom\'s private Needle.AI dashboard data: memory/profile, tasks, projects, situations, check-ins, and plans. Only use for Tom/self-calls.',
+  parameters: {
+    type: 'object',
+    properties: {
+      topic: {
+        type: 'string',
+        enum: ['everything', 'tasks', 'projects', 'situations', 'today', 'memory'],
+        description: 'Which Needle context to retrieve.',
+      },
+      limit: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 25,
+        description: 'Maximum records per section.',
+      },
+      includeCompletedTasks: {
+        type: 'boolean',
+        description: 'Whether to include done/ignored tasks as well as open tasks.',
+      },
+    },
+    required: ['topic'],
+    additionalProperties: false,
+  },
+};
+
+const CREATE_NEEDLE_TASK_TOOL = {
+  type: 'function',
+  name: 'create_needle_task',
+  description:
+    'Create a task in Tom\'s Needle.AI database after Tom confirms the exact task to add.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: {
+        type: 'boolean',
+        description: 'Must be true only after Tom explicitly confirms the exact write.',
+      },
+      title: { type: 'string', description: 'Task title.' },
+      notes: { type: 'string', description: 'Optional task notes.' },
+      status: {
+        type: 'string',
+        enum: ['open', 'done', 'ignored'],
+        description: 'Task status. Usually open.',
+      },
+      importance: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 5,
+        description: 'Importance from 1 to 5.',
+      },
+      effort: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 5,
+        description: 'Effort from 1 to 5.',
+      },
+      dueDate: {
+        type: 'string',
+        nullable: true,
+        description: 'Optional due date in YYYY-MM-DD format.',
+      },
+      projectId: {
+        type: 'integer',
+        nullable: true,
+        description: 'Optional Needle project id.',
+      },
+      projectName: {
+        type: 'string',
+        nullable: true,
+        description: 'Optional existing Needle project name to attach the task to.',
+      },
+      lifeAreaId: {
+        type: 'integer',
+        nullable: true,
+        description: 'Optional Needle life area id.',
+      },
+      lifeAreaName: {
+        type: 'string',
+        nullable: true,
+        description: 'Optional existing Needle life area name to attach the task to.',
+      },
+    },
+    required: ['confirmedByTom', 'title'],
+    additionalProperties: false,
+  },
+};
+
+const UPDATE_NEEDLE_TASK_TOOL = {
+  type: 'function',
+  name: 'update_needle_task',
+  description:
+    'Update a known Needle.AI task after Tom confirms the exact change, such as marking a task done.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: {
+        type: 'boolean',
+        description: 'Must be true only after Tom explicitly confirms the exact write.',
+      },
+      taskId: { type: 'integer', description: 'Existing Needle task id.' },
+      title: { type: 'string', description: 'Optional replacement task title.' },
+      status: {
+        type: 'string',
+        enum: ['open', 'done', 'ignored'],
+        description: 'Optional replacement task status.',
+      },
+      importance: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 5,
+        description: 'Optional importance from 1 to 5.',
+      },
+      effort: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 5,
+        description: 'Optional effort from 1 to 5.',
+      },
+      dueDate: {
+        type: 'string',
+        nullable: true,
+        description: 'Optional replacement due date in YYYY-MM-DD format, or null to clear.',
+      },
+      notes: { type: 'string', description: 'Optional replacement notes.' },
+      projectId: {
+        type: 'integer',
+        nullable: true,
+        description: 'Optional existing Needle project id, or null to clear.',
+      },
+      projectName: {
+        type: 'string',
+        nullable: true,
+        description: 'Optional existing Needle project name.',
+      },
+      lifeAreaId: {
+        type: 'integer',
+        nullable: true,
+        description: 'Optional existing Needle life area id, or null to clear.',
+      },
+      lifeAreaName: {
+        type: 'string',
+        nullable: true,
+        description: 'Optional existing Needle life area name.',
+      },
+    },
+    required: ['confirmedByTom', 'taskId'],
+    additionalProperties: false,
+  },
+};
+
+const CREATE_NEEDLE_CHECKIN_TOOL = {
+  type: 'function',
+  name: 'create_needle_checkin',
+  description:
+    'Create a daily check-in in Tom\'s Needle.AI database after Tom confirms the captured check-in.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: {
+        type: 'boolean',
+        description: 'Must be true only after Tom explicitly confirms the exact write.',
+      },
+      energyLevel: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 10,
+        description: 'Energy level from 1 to 10.',
+      },
+      mood: { type: 'string', description: 'Mood notes.' },
+      sleep: { type: 'string', description: 'Sleep notes.' },
+      healthStatus: { type: 'string', description: 'Health/body status notes.' },
+      mainThing: { type: 'string', description: 'The main thing Tom wants to focus on.' },
+      resistance: { type: 'string', description: 'Resistance, avoidance, or friction.' },
+      brainDump: { type: 'string', description: 'Additional thoughts or context.' },
+    },
+    required: ['confirmedByTom', 'energyLevel'],
+    additionalProperties: false,
+  },
+};
+
+const CREATE_NEEDLE_SITUATION_TOOL = {
+  type: 'function',
+  name: 'create_needle_situation',
+  description:
+    'Create a new active Needle.AI situation after Tom confirms the title and urgency.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: {
+        type: 'boolean',
+        description: 'Must be true only after Tom explicitly confirms the exact write.',
+      },
+      title: { type: 'string', description: 'Situation title.' },
+      category: { type: 'string', description: 'Situation category. Defaults to custom.' },
+      urgency: {
+        type: 'string',
+        enum: ['low', 'medium', 'high', 'crisis'],
+        description: 'Situation urgency.',
+      },
+      summary: {
+        type: 'string',
+        description: 'Optional summary so far, stored on the initial intake session.',
+      },
+    },
+    required: ['confirmedByTom', 'title'],
+    additionalProperties: false,
+  },
+};
+
+const NEEDLE_TOOLS = [
+  GET_NEEDLE_BRIEFING_TOOL,
+  CREATE_NEEDLE_TASK_TOOL,
+  UPDATE_NEEDLE_TASK_TOOL,
+  CREATE_NEEDLE_CHECKIN_TOOL,
+  CREATE_NEEDLE_SITUATION_TOOL,
+];
+
+const REALTIME_TOOLS = [CAPTURE_MESSAGE_TOOL, ...NEEDLE_TOOLS];
+
 const INVALID_PHONE_VALUES = new Set([
   '',
   'caller id',
@@ -760,8 +1035,12 @@ const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}
   if (isSelfCaller) {
     instructions +=
       '\nCALL CONTEXT: Caller ID matches Tom\'s number. Default to self_note mode unless caller explicitly says otherwise.';
+    instructions +=
+      '\nNEEDLE ACCESS: Because this is Tom, you may use Needle tools to read his private dashboard and, after explicit confirmation, create or update Needle records.';
   } else {
     instructions += '\nCALL CONTEXT: Treat this caller as an external contact unless clarified otherwise.';
+    instructions +=
+      '\nNEEDLE ACCESS: Do not reveal, summarize, create, or update Tom\'s private Needle data for external callers.';
   }
 
   if (hasCallerPhone) {
@@ -864,6 +1143,7 @@ export function attachRealtimeServer(server) {
     let inferredCallerPhone = null;
     let isSelfCaller = false;
     let lastCapturedMessage = null;
+    let lastNeedleAction = null;
     let messageDispatchStatus = null;
     let callStartMs = Date.now();
     let callEndMs = null;
@@ -995,7 +1275,7 @@ export function attachRealtimeServer(server) {
             type: 'realtime',
             model: DEFAULT_MODEL,
             instructions,
-            tools: [CAPTURE_MESSAGE_TOOL],
+            tools: REALTIME_TOOLS,
           },
         })
       );
@@ -1017,6 +1297,27 @@ export function attachRealtimeServer(server) {
         callerPhoneLast4: phoneLast4,
         isSelfCaller,
       });
+    };
+
+    const sendFunctionOutput = (output, logLabel = 'function_call') => {
+      if (!functionCallId || openaiSocket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      try {
+        openaiSocket.send(
+          JSON.stringify({
+            type: 'conversation.item.create',
+            item: {
+              type: 'function_call_output',
+              call_id: functionCallId,
+              output: JSON.stringify(output),
+            },
+          })
+        );
+      } catch (err) {
+        console.warn(`[${logLabel}] failed to send tool output`, err);
+      }
     };
 
     const handleCaptureMessage = async (parsedArgs) => {
@@ -1059,31 +1360,101 @@ export function attachRealtimeServer(server) {
       const smsResult = await sendSmsToOwner(smsBody);
       messageDispatchStatus = smsResult;
 
-      if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
-        const toolOutput = {
-          type: 'conversation.item.create',
-          item: {
-            type: 'function_call_output',
-            call_id: functionCallId,
-            output: JSON.stringify({
-              delivered: smsResult.delivered,
-              channel: 'sms',
-              reason: smsResult.reason || null,
-            }),
-          },
-        };
-
-        try {
-          openaiSocket.send(JSON.stringify(toolOutput));
-        } catch (err) {
-          console.warn('[capture_message] failed to send tool output', err);
-        }
-      }
+      sendFunctionOutput(
+        {
+          delivered: smsResult.delivered,
+          channel: 'sms',
+          reason: smsResult.reason || null,
+        },
+        'capture_message'
+      );
 
       if (smsResult.delivered) {
         forceResponse('Thanks. I captured your message and passed it along to Tom.');
       } else {
         forceResponse('Thanks. I captured your message. Delivery may be delayed right now.');
+      }
+    };
+
+    const handleNeedleTool = async (toolName, parsedArgs) => {
+      if (!isSelfCaller) {
+        sendFunctionOutput(
+          {
+            ok: false,
+            reason: 'not_authorized',
+            message: 'Needle data is private and only available when Tom is the caller.',
+          },
+          toolName
+        );
+        forceResponse('I can only access Tom\'s private Needle dashboard when I know I am speaking with Tom.');
+        return;
+      }
+
+      try {
+        let result;
+
+        switch (toolName) {
+          case 'get_needle_briefing':
+            result = await getNeedleBriefing(parsedArgs);
+            break;
+          case 'create_needle_task':
+            result = await createNeedleTask(parsedArgs);
+            break;
+          case 'update_needle_task':
+            result = await updateNeedleTask(parsedArgs);
+            break;
+          case 'create_needle_checkin':
+            result = await createNeedleCheckIn(parsedArgs);
+            break;
+          case 'create_needle_situation':
+            result = await createNeedleSituation(parsedArgs);
+            break;
+          default:
+            result = { ok: false, reason: 'unsupported_needle_tool' };
+        }
+
+        lastNeedleAction = {
+          toolName,
+          ok: Boolean(result?.ok),
+          reason: result?.reason || null,
+          at: new Date().toISOString(),
+        };
+
+        sendFunctionOutput(result, toolName);
+
+        if (toolName === 'get_needle_briefing') {
+          forceResponse('Use the Needle tool result to answer Tom directly and concisely. Mention task or project ids only if they help with a follow-up change.');
+          return;
+        }
+
+        if (result?.ok === false && result?.reason === 'confirmation_required') {
+          forceResponse('Before I change Needle, summarize the exact change and ask Tom to confirm it.');
+          return;
+        }
+
+        if (result?.ok) {
+          forceResponse('Briefly confirm the Needle change that was completed, using the tool result for exact names or ids.');
+          return;
+        }
+
+        forceResponse('Tell Tom the Needle change was not completed and briefly explain why.');
+      } catch (err) {
+        console.warn(`[Needle] ${toolName} failed`, err);
+        lastNeedleAction = {
+          toolName,
+          ok: false,
+          reason: err?.message || 'Needle tool failed',
+          at: new Date().toISOString(),
+        };
+        sendFunctionOutput(
+          {
+            ok: false,
+            reason: 'needle_tool_error',
+            message: err?.message || 'Needle tool failed.',
+          },
+          toolName
+        );
+        forceResponse('I could not complete that Needle request. Briefly tell Tom what went wrong and ask what he wants to do next.');
       }
     };
 
@@ -1102,6 +1473,12 @@ export function attachRealtimeServer(server) {
           return;
         }
 
+        if (NEEDLE_TOOLS.some((tool) => tool.name === functionCallName)) {
+          await handleNeedleTool(functionCallName, parsedArgs);
+          resetFunctionCallState();
+          return;
+        }
+
         if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
           openaiSocket.send(
             JSON.stringify({
@@ -1109,7 +1486,7 @@ export function attachRealtimeServer(server) {
               item: {
                 type: 'function_call_output',
                 call_id: functionCallId,
-                output: JSON.stringify({ delivered: false, channel: 'sms', reason: 'Unsupported tool name' }),
+                output: JSON.stringify({ ok: false, reason: 'Unsupported tool name' }),
               },
             })
           );
@@ -1304,6 +1681,7 @@ export function attachRealtimeServer(server) {
         isSelfCaller,
         capturedMode: lastCapturedMessage?.mode || null,
         capturedSubject: lastCapturedMessage?.subject || null,
+        lastNeedleAction,
         messageDelivered: messageDispatchStatus?.delivered || false,
         deliveryReason: messageDispatchStatus?.reason || null,
         callDurationSeconds,
@@ -1373,7 +1751,7 @@ export function connectToOpenAI() {
             voice: 'marin',
           },
         },
-        tools: [CAPTURE_MESSAGE_TOOL],
+        tools: REALTIME_TOOLS,
       },
     };
 

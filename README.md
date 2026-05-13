@@ -1,14 +1,17 @@
 # Voice AI System
 
-A Node.js voice assistant backend that connects live Twilio phone calls to the OpenAI Realtime API, runs a persona-driven assistant (Victoria), and forwards captured caller messages/self-notes to Tom by SMS.
+A Node.js voice assistant backend that connects live Twilio phone calls to the OpenAI Realtime API, runs a persona-driven assistant (Victoria), forwards captured caller messages/self-notes to Tom by SMS, and can act as a voice interface for Tom's private Needle.AI database.
 
 ## System Purpose
 
-This system is built for two primary call flows:
+This system is built for three primary call flows:
 - External callers can ask about Tom's background, work, and technical skills, then leave a structured message.
 - Tom can call his own number to leave himself a quick voice note.
+- Tom can ask Victoria about Needle.AI tasks, projects, situations, check-ins, plans, and create/update selected Needle records by voice.
 
 When the assistant confirms a message, it calls a single tool (`capture_message`) and dispatches the payload to `TWILIO_OWNER_PHONE` over SMS.
+
+When Tom is the caller, Victoria can also call scoped Needle tools backed by the same libSQL database used by the Needle Next.js app. External callers are not allowed to read or write Needle data.
 
 ## Languages and Core Technologies
 
@@ -41,6 +44,7 @@ When the assistant confirms a message, it calls a single tool (`capture_message`
 - `src/server.js`
 - `src/realtimeHandler.js`
 - `twilio`, `ws`, `express`, `dotenv`
+- `@libsql/client` for shared Needle.AI database access
 
 ### Present but currently dormant or unused
 - `src/firebase.js` and `firebase-admin` dependency (not in active call path)
@@ -61,6 +65,7 @@ flowchart LR
   F --> E
   F --> H[Twilio SMS API]
   H --> I[TWILIO_OWNER_PHONE]
+  F --> J[Needle.AI libSQL database]
 ```
 
 ## End-to-End Call Flow
@@ -73,8 +78,9 @@ flowchart LR
 6. OpenAI returns response audio deltas; bridge forwards them back to Twilio.
 7. On user barge-in, the bridge sends Twilio `clear` and OpenAI `response.cancel`.
 8. When Victoria confirms a message, model calls `capture_message`.
-9. Bridge validates/normalizes payload, formats outbound text, and sends SMS via Twilio.
-10. Assistant confirms success/failure to the caller and logs a concise call summary.
+9. When Tom asks about Needle, model calls scoped Needle read/write tools.
+10. Bridge validates/normalizes payloads, sends SMS or database operations, then returns tool output.
+11. Assistant confirms success/failure to the caller and logs a concise call summary.
 
 ## Realtime Session Design
 
@@ -107,10 +113,23 @@ Behavior notes:
 - `TWILIO_OWNER_PHONE` caller ID match marks the call as self-note context.
 - Tool output always includes `{ delivered, channel: "sms", reason? }`.
 
+## Needle.AI Tool Contracts
+
+Victoria can use these tools only for self-calls, determined by caller ID matching `TWILIO_OWNER_PHONE`:
+
+- `get_needle_briefing`: read profile/memory, life areas, active projects, tasks, situations, recent check-ins, daily plans, and Next Move plans.
+- `create_needle_task`: create a task after Tom confirms the exact task.
+- `update_needle_task`: update a known task after Tom confirms the exact change.
+- `create_needle_checkin`: create a daily check-in after Tom confirms the captured check-in.
+- `create_needle_situation`: create a new active situation and initial intake session after Tom confirms it.
+
+Victoria does not receive arbitrary SQL access. The voice service is a client of Needle's existing database, not the owner of Needle's schema or migrations.
+
 ## Directory Map
 
 - `src/server.js`: Express endpoints, TwiML response, server bootstrap
 - `src/realtimeHandler.js`: Twilio/OpenAI realtime bridge, prompt/instructions, message capture, SMS dispatch
+- `src/needleData.js`: scoped Needle.AI database adapter for read/write voice tools
 - `src/twilioWebhook.js`: Alternate Twilio webhook helper (currently not wired)
 - `src/firebase.js`: Dormant Firebase admin initialization (not used in active flow)
 - `.env.example`: runtime configuration template
@@ -127,11 +146,22 @@ Behavior notes:
 - `TWILIO_OWNER_PHONE`
 - `TWILIO_SMS_FROM` (or set `PHONE_RELAY_NUMBER` as fallback sender)
 
+### Required for deployed Needle.AI voice access
+- `NEEDLE_DATABASE_URL` (same libSQL/Turso database used by Needle)
+- `NEEDLE_DATABASE_AUTH_TOKEN` if the shared database requires auth
+
+For local development, the voice service auto-detects the sibling Needle database at `../needle.ai/data/needle.db` when present. You can also set:
+
+```bash
+NEEDLE_DATABASE_URL=file:/Users/thomasdevito/Projects/needle.ai/data/needle.db
+```
+
 ### Optional
 - `OPENAI_REALTIME_ENDPOINT` (runtime forces model query param to `gpt-realtime-2`)
 - `PHONE_RELAY_NUMBER`
 - `PORT` (default `8080`)
 - `VERBOSE_OPENAI_LOGS=true` for deeper event logs
+- `APP_TIMEZONE` (default `America/New_York`)
 
 ### Dormant
 - `FIREBASE_SERVICE_ACCOUNT_JSON` (not needed in current runtime path)
