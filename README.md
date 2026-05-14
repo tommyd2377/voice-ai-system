@@ -1,17 +1,17 @@
 # Voice AI System
 
-A Node.js voice assistant backend that connects live Twilio phone calls to the OpenAI Realtime API, runs a persona-driven assistant (Victoria), forwards captured caller messages/self-notes to Tom by SMS, and can act as a voice interface for Tom's private Needle.AI database.
+A Node.js voice assistant backend that connects live Twilio phone calls to the OpenAI Realtime API, runs a persona-driven assistant (Victoria), captures confirmed caller messages as TaskDeck tasks, and can act as a voice interface for Tom's private TaskDeck.AI database.
 
 ## System Purpose
 
 This system is built for three primary call flows:
 - External callers can ask about Tom's background, work, and technical skills, then leave a structured message.
 - Tom can call his own number to leave himself a quick voice note.
-- Tom can ask Victoria about Needle.AI tasks, projects, situations, check-ins, plans, and create/update selected Needle records by voice.
+- Tom can ask Victoria about TaskDeck.AI tasks, projects, situations, check-ins, plans, and create/update selected TaskDeck records by voice.
 
-When the assistant confirms a message, it calls a single tool (`capture_message`) and dispatches the payload to `TWILIO_OWNER_PHONE` over SMS.
+When an external caller confirms a message, Victoria calls a narrow tool (`create_taskdeck_caller_intake_task`) that creates a new open TaskDeck task from that caller's own message.
 
-When Tom is the caller, Victoria can also call scoped Needle tools backed by the same libSQL database used by the Needle Next.js app. External callers are not allowed to read or write Needle data.
+When Tom is the caller, Victoria can also call scoped TaskDeck tools backed by the same libSQL database used by the TaskDeck Next.js app. External callers are not allowed to read, search, update, or attach to private TaskDeck data.
 
 ## Languages and Core Technologies
 
@@ -27,7 +27,6 @@ When Tom is the caller, Victoria can also call scoped Needle tools backed by the
 ### Realtime and Telephony
 - `ws` WebSocket server for Twilio Media Streams
 - Twilio Programmable Voice (`<Connect><Stream>`) for call audio ingress
-- Twilio REST API for SMS delivery of captured messages
 
 ### AI and Speech
 - OpenAI Realtime API (`gpt-realtime-2`)
@@ -43,12 +42,12 @@ When Tom is the caller, Victoria can also call scoped Needle tools backed by the
 ### Actively used in runtime path
 - `src/server.js`
 - `src/realtimeHandler.js`
-- `twilio`, `ws`, `express`, `dotenv`
-- `@libsql/client` for shared Needle.AI database access
+- `ws`, `express`, `dotenv`
+- `@libsql/client` for shared TaskDeck.AI database access
 
 ### Present but currently dormant or unused
 - `src/firebase.js` and `firebase-admin` dependency (not in active call path)
-- `src/twilioWebhook.js` helper (not wired in `src/server.js`)
+- `src/twilioWebhook.js` helper and `twilio` package (not wired in `src/server.js`)
 - `@openai/agents` and `@openai/agents-extensions` packages (installed, not referenced by active code)
 
 ## Architecture Overview
@@ -63,9 +62,7 @@ flowchart LR
   F --> G[OpenAI Realtime API gpt-realtime-2]
   G --> F
   F --> E
-  F --> H[Twilio SMS API]
-  H --> I[TWILIO_OWNER_PHONE]
-  F --> J[Needle.AI libSQL database]
+  F --> J[TaskDeck.AI libSQL database]
 ```
 
 ## End-to-End Call Flow
@@ -77,9 +74,9 @@ flowchart LR
 5. Audio frames are forwarded from Twilio to OpenAI (`input_audio_buffer.append`).
 6. OpenAI returns response audio deltas; bridge forwards them back to Twilio.
 7. On user barge-in, the bridge sends Twilio `clear` and OpenAI `response.cancel`.
-8. When Victoria confirms a message, model calls `capture_message`.
-9. When Tom asks about Needle, model calls scoped Needle read/write tools.
-10. Bridge validates/normalizes payloads, sends SMS or database operations, then returns tool output.
+8. When Victoria confirms an external caller message, the model calls `create_taskdeck_caller_intake_task`.
+9. When Tom asks about TaskDeck, model calls scoped TaskDeck read/write tools.
+10. Bridge validates/normalizes payloads, performs scoped database operations, then returns tool output.
 11. Assistant confirms success/failure to the caller and logs a concise call summary.
 
 ## Realtime Session Design
@@ -93,13 +90,13 @@ flowchart LR
 `attachRealtimeServer()` manages:
 - Twilio stream lifecycle (`start`, `media`, `mark`, `stop`, close/error)
 - OpenAI lifecycle (`session.*`, `response.*`, function call deltas)
-- Function-call assembly for `capture_message`
+- Function-call assembly for TaskDeck caller-intake and private self-call tools
 - Usage accounting (`input/output/audio/cached token` aggregates)
 
-## Tool Contract: `capture_message`
+## Tool Contract: `create_taskdeck_caller_intake_task`
 
-The assistant uses one function tool:
-- `mode`: `caller_message | self_note`
+The assistant uses this external-caller-safe function tool:
+- `confirmedByCaller`: boolean
 - `callerName`: nullable string
 - `contactPhone`: nullable string
 - `contactEmail`: nullable string
@@ -110,26 +107,29 @@ The assistant uses one function tool:
 
 Behavior notes:
 - Missing contact phone falls back to caller ID when available.
-- `TWILIO_OWNER_PHONE` caller ID match marks the call as self-note context.
-- Tool output always includes `{ delivered, channel: "sms", reason? }`.
+- The tool only creates a new open TaskDeck task.
+- The tool does not read, search, update, or attach to private TaskDeck records.
+- Tool output includes `{ ok, channel: "taskdeck_task", taskId?, reason? }`.
 
-## Needle.AI Tool Contracts
+## TaskDeck.AI Tool Contracts
 
 Victoria can use these tools only for self-calls, determined by caller ID matching `TWILIO_OWNER_PHONE`:
 
-- `get_needle_briefing`: read profile/memory, life areas, active projects, tasks, situations, recent check-ins, daily plans, and Next Move plans.
-- `create_needle_task`: create a task after Tom confirms the exact task.
-- `update_needle_task`: update a known task after Tom confirms the exact change.
-- `create_needle_checkin`: create a daily check-in after Tom confirms the captured check-in.
-- `create_needle_situation`: create a new active situation and initial intake session after Tom confirms it.
+- `get_taskdeck_briefing`: read profile/memory, life areas, active projects, tasks, situations, recent check-ins, daily plans, and Next Move plans.
+- `create_taskdeck_task`: create a task after Tom confirms the exact task.
+- `update_taskdeck_task`: update a known task after Tom confirms the exact change.
+- `create_taskdeck_checkin`: create a daily check-in after Tom confirms the captured check-in.
+- `create_taskdeck_situation`: create a new active situation and initial intake session after Tom confirms it.
 
-Victoria does not receive arbitrary SQL access. The voice service is a client of Needle's existing database, not the owner of Needle's schema or migrations.
+External callers get only `create_taskdeck_caller_intake_task`, which inserts a standalone task from their confirmed message and returns only a minimal result.
+
+Victoria does not receive arbitrary SQL access. The voice service is a client of TaskDeck's existing database, not the owner of TaskDeck's schema or migrations.
 
 ## Directory Map
 
 - `src/server.js`: Express endpoints, TwiML response, server bootstrap
-- `src/realtimeHandler.js`: Twilio/OpenAI realtime bridge, prompt/instructions, message capture, SMS dispatch
-- `src/needleData.js`: scoped Needle.AI database adapter for read/write voice tools
+- `src/realtimeHandler.js`: Twilio/OpenAI realtime bridge, prompt/instructions, TaskDeck caller intake
+- `src/taskdeckData.js`: scoped TaskDeck.AI database adapter for read/write voice tools
 - `src/twilioWebhook.js`: Alternate Twilio webhook helper (currently not wired)
 - `src/firebase.js`: Dormant Firebase admin initialization (not used in active flow)
 - `.env.example`: runtime configuration template
@@ -139,21 +139,18 @@ Victoria does not receive arbitrary SQL access. The voice service is a client of
 ### Required for core call + AI flow
 - `OPENAI_API_KEY`
 - `TWILIO_STREAM_URL`
-- `TWILIO_ACCOUNT_SID`
-- `TWILIO_AUTH_TOKEN`
 
-### Required for SMS delivery
+### Required for Tom/self-caller private TaskDeck access
 - `TWILIO_OWNER_PHONE`
-- `TWILIO_SMS_FROM` (or set `PHONE_RELAY_NUMBER` as fallback sender)
 
-### Required for deployed Needle.AI voice access
-- `NEEDLE_DATABASE_URL` (same libSQL/Turso database used by Needle)
-- `NEEDLE_DATABASE_AUTH_TOKEN` if the shared database requires auth
+### Required for deployed TaskDeck.AI voice access
+- `TASKDECK_DATABASE_URL` (same libSQL/Turso database used by TaskDeck)
+- `TASKDECK_DATABASE_AUTH_TOKEN` if the shared database requires auth
 
-For local development, the voice service auto-detects the sibling Needle database at `../needle.ai/data/needle.db` when present. You can also set:
+For local development, the voice service auto-detects the sibling TaskDeck database at `../taskdeck/data/taskdeck.db` when present. You can also set:
 
 ```bash
-NEEDLE_DATABASE_URL=file:/Users/thomasdevito/Projects/needle.ai/data/needle.db
+TASKDECK_DATABASE_URL=file:/Users/thomasdevito/Projects/taskdeck/data/taskdeck.db
 ```
 
 ### Optional
@@ -192,13 +189,13 @@ curl http://localhost:8080/health
 
 ## Operational Notes
 
-- If SMS config is missing, voice conversation still works; message dispatch returns `delivered: false` and assistant communicates possible delay.
-- No persistent datastore is currently in the active flow; call/message handling is in-memory per session plus logs.
+- External caller messages are persisted as standalone open TaskDeck tasks after caller confirmation.
+- If TaskDeck database access is unavailable, voice conversation still works but caller-intake task creation fails.
 - Firebase can be reintroduced later through a storage adapter path without changing call transport architecture.
 
 ## Troubleshooting
 
 - `TWILIO_STREAM_URL not configured`: set `TWILIO_STREAM_URL` in `.env`.
 - OpenAI connection fails: verify `OPENAI_API_KEY` and network egress.
-- No SMS delivered: verify `TWILIO_OWNER_PHONE`, `TWILIO_SMS_FROM`, and Twilio credentials.
-- Assistant talks but cannot send message: check logs for `capture_message` tool output and SMS error reason.
+- Tom is not recognized as self-caller: verify `TWILIO_OWNER_PHONE` matches the caller ID format.
+- Assistant talks but cannot create caller task: check TaskDeck database env vars and logs for `create_taskdeck_caller_intake_task`.

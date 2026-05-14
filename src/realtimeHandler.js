@@ -1,12 +1,17 @@
 import WebSocket, { WebSocketServer } from 'ws';
-import twilio from 'twilio';
 import {
-  createNeedleCheckIn,
-  createNeedleSituation,
-  createNeedleTask,
-  getNeedleBriefing,
-  updateNeedleTask,
-} from './needleData.js';
+  getCodebaseOverview,
+  readCodeSnippet,
+  searchCodebase,
+} from './codebaseData.js';
+import {
+  createTaskDeckCallerIntakeTask,
+  createTaskDeckCheckIn,
+  createTaskDeckSituation,
+  createTaskDeckTask,
+  getTaskDeckBriefing,
+  updateTaskDeckTask,
+} from './taskdeckData.js';
 
 const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
 const ASSISTANT_GREETING = "Hey, I'm Victoria, Tom's AI assistant. How can I help you today?";
@@ -273,21 +278,21 @@ Tom is currently especially interested in:
 - existential themes in modern life
 
 ===============================================================================
-NEEDLE.AI OPERATING DASHBOARD
+TASKDECK.AI OPERATING DASHBOARD
 ===============================================================================
 
-Needle.AI is Tom's private personal operating dashboard.
+TaskDeck is Tom's private personal operating dashboard.
 
-Its central question is:
-"What should I do today to move the needle?"
+Its core promise is:
+"Choose the right move today."
 
-Needle exists to turn vague overwhelm, scattered projects, and half-formed anxiety
+TaskDeck exists to turn vague overwhelm, scattered projects, and half-formed anxiety
 into concrete next actions. It is not a generic productivity app. It is a private
 prioritization system for identifying leverage, reducing avoidance, and choosing
 the next useful move across Tom's work, health, creative projects, acting,
 administrative life, and personal stability.
 
-Needle stores:
+TaskDeck stores:
 - Tom's durable memory/profile
 - life areas
 - projects
@@ -298,7 +303,7 @@ Needle stores:
 - intake transcripts
 - generated Next Move plans
 
-Needle's style is:
+TaskDeck's style is:
 - practical
 - psychologically perceptive
 - direct without being harsh
@@ -306,16 +311,21 @@ Needle's style is:
 - focused on momentum over fantasy productivity
 
 When Tom asks what is going on, what his tasks are, what he should do today,
-what is stuck, or what Needle knows, Victoria should understand that he is asking
-for Needle context and should use Needle tools when authorized.
+what is stuck, or what TaskDeck knows, Victoria should understand that he is asking
+for TaskDeck context and should use TaskDeck tools when authorized.
 
-For Needle writes:
-- never write private Needle data for external callers
+For Tom/self-call TaskDeck writes:
 - never use arbitrary SQL
 - summarize the exact change first
 - ask Tom for confirmation
-- only call a Needle write tool after Tom confirms
+- only call a TaskDeck write tool after Tom confirms
 - after the tool succeeds, briefly confirm what changed
+
+For external caller intake:
+- never read, summarize, update, or reveal private TaskDeck data
+- create only a new caller-intake task from the caller's own confirmed message
+  using create_taskdeck_caller_intake_task
+- do not attach the task to private projects, situations, or life areas
 
 ===============================================================================
 WORK HISTORY
@@ -575,7 +585,7 @@ If asked how Victoria was built:
 - OpenAI Realtime API
 - realtime WebSocket audio streaming
 - structured tool calls
-- SMS relay systems
+- TaskDeck caller-intake tasks
 
 Flow:
 1) Incoming call hits webhook
@@ -584,7 +594,7 @@ Flow:
 4) OpenAI generates realtime responses
 5) Responses stream back live
 6) Structured tool calls capture notes/messages
-7) SMS delivery handled through Twilio
+7) Confirmed caller messages are saved as TaskDeck tasks
 
 Technical concepts Victoria may discuss:
 - bidirectional realtime streaming
@@ -615,18 +625,17 @@ Collect:
 - preferred contact method when possible
 
 Then summarize and ask for confirmation.
+After the caller confirms, call create_taskdeck_caller_intake_task exactly once.
 
 For self_note:
-Capture quickly and efficiently.
+Capture quickly and efficiently. Use TaskDeck task tools only after Tom confirms
+the exact task or note to save.
 
-After confirmation:
-call capture_message exactly once.
+If the caller intake task is created:
+"Perfect. I added that to Tom's task list."
 
-If delivered=true:
-"Perfect. I'll make sure Tom gets that."
-
-If delivered=false:
-"I captured the message, though delivery may be delayed."
+If the caller intake task cannot be created:
+"I captured the details, but I couldn't add them to TaskDeck right now."
 
 Never promise response timelines.
 
@@ -659,7 +668,7 @@ OUT OF SCOPE REQUESTS
 
 If asked unrelated questions:
 
-"I'm really just here to talk about Tom and his work, but I can absolutely pass along a message if you'd like."
+"I'm really just here to talk about Tom and his work, but I can absolutely take down a message if you'd like."
 
 ===============================================================================
 ENDING THE CALL
@@ -667,7 +676,7 @@ ENDING THE CALL
 
 When the conversation naturally concludes:
 
-"Thanks for calling. I'll pass that along to Tom. Have a great day."
+"Thanks for calling. Have a great day."
 `.trim();
 
 const configuredRealtimeEndpoint = process.env.OPENAI_REALTIME_ENDPOINT;
@@ -685,22 +694,22 @@ const DEFAULT_REALTIME_ENDPOINT = (() => {
 })();
 const DEFAULT_MODEL = 'gpt-realtime-2';
 
-const CAPTURE_MESSAGE_TOOL = {
+const CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL = {
   type: 'function',
-  name: 'capture_message',
-  description: 'Capture a caller message or self-note and dispatch it to Tom via SMS.',
+  name: 'create_taskdeck_caller_intake_task',
+  description:
+    'Create one narrow TaskDeck task from an external caller\'s confirmed message. This tool does not read TaskDeck data and must not be used for arbitrary TaskDeck writes.',
   parameters: {
     type: 'object',
     properties: {
-      mode: {
-        type: 'string',
-        enum: ['caller_message', 'self_note'],
-        description: 'Message type. Use self_note when Tom is calling himself.',
+      confirmedByCaller: {
+        type: 'boolean',
+        description: 'Must be true only after the caller confirms the exact message to save for Tom.',
       },
       callerName: {
         type: 'string',
         nullable: true,
-        description: 'Caller name. Nullable for self_note mode.',
+        description: 'Caller name, if available.',
       },
       contactPhone: {
         type: 'string',
@@ -730,23 +739,94 @@ const CAPTURE_MESSAGE_TOOL = {
         description: 'Estimated urgency.',
       },
     },
-    required: ['mode', 'subject', 'messageBody', 'callbackRequested', 'priority'],
+    required: ['confirmedByCaller', 'subject', 'messageBody', 'callbackRequested', 'priority'],
     additionalProperties: false,
   },
 };
 
-const GET_NEEDLE_BRIEFING_TOOL = {
+const GET_CODEBASE_OVERVIEW_TOOL = {
   type: 'function',
-  name: 'get_needle_briefing',
+  name: 'get_codebase_overview',
   description:
-    'Read Tom\'s private Needle.AI dashboard data: memory/profile, tasks, projects, situations, check-ins, and plans. Only use for Tom/self-calls.',
+    'List safe, non-sensitive files from the currently running voice-ai-system codebase, with git metadata. Only use for Tom/self-calls.',
+  parameters: {
+    type: 'object',
+    properties: {
+      maxFiles: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 100,
+        description: 'Maximum number of file entries to return.',
+      },
+    },
+    additionalProperties: false,
+  },
+};
+
+const SEARCH_CODEBASE_TOOL = {
+  type: 'function',
+  name: 'search_codebase',
+  description:
+    'Search safe, non-sensitive text files in the currently running voice-ai-system codebase. Only use for Tom/self-calls.',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: {
+        type: 'string',
+        description: 'Case-insensitive text to search for.',
+      },
+      limit: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 20,
+        description: 'Maximum number of matching lines to return.',
+      },
+    },
+    required: ['query'],
+    additionalProperties: false,
+  },
+};
+
+const READ_CODE_SNIPPET_TOOL = {
+  type: 'function',
+  name: 'read_code_snippet',
+  description:
+    'Read a line-numbered snippet from a safe, non-sensitive file in the currently running voice-ai-system codebase. Only use for Tom/self-calls.',
+  parameters: {
+    type: 'object',
+    properties: {
+      filePath: {
+        type: 'string',
+        description: 'Relative file path inside the repository, such as src/realtimeHandler.js.',
+      },
+      startLine: {
+        type: 'integer',
+        minimum: 1,
+        description: 'First line to read. Defaults to 1.',
+      },
+      endLine: {
+        type: 'integer',
+        minimum: 1,
+        description: 'Last line to read. The tool caps snippets to keep responses small.',
+      },
+    },
+    required: ['filePath'],
+    additionalProperties: false,
+  },
+};
+
+const GET_TASKDECK_BRIEFING_TOOL = {
+  type: 'function',
+  name: 'get_taskdeck_briefing',
+  description:
+    'Read Tom\'s private TaskDeck dashboard data: memory/profile, tasks, projects, situations, check-ins, and plans. Only use for Tom/self-calls.',
   parameters: {
     type: 'object',
     properties: {
       topic: {
         type: 'string',
         enum: ['everything', 'tasks', 'projects', 'situations', 'today', 'memory'],
-        description: 'Which Needle context to retrieve.',
+        description: 'Which TaskDeck context to retrieve.',
       },
       limit: {
         type: 'integer',
@@ -764,11 +844,11 @@ const GET_NEEDLE_BRIEFING_TOOL = {
   },
 };
 
-const CREATE_NEEDLE_TASK_TOOL = {
+const CREATE_TASKDECK_TASK_TOOL = {
   type: 'function',
-  name: 'create_needle_task',
+  name: 'create_taskdeck_task',
   description:
-    'Create a task in Tom\'s Needle.AI database after Tom confirms the exact task to add.',
+    'Create a task in Tom\'s TaskDeck database after Tom confirms the exact task to add.',
   parameters: {
     type: 'object',
     properties: {
@@ -803,22 +883,22 @@ const CREATE_NEEDLE_TASK_TOOL = {
       projectId: {
         type: 'integer',
         nullable: true,
-        description: 'Optional Needle project id.',
+        description: 'Optional TaskDeck project id.',
       },
       projectName: {
         type: 'string',
         nullable: true,
-        description: 'Optional existing Needle project name to attach the task to.',
+        description: 'Optional existing TaskDeck project name to attach the task to.',
       },
       lifeAreaId: {
         type: 'integer',
         nullable: true,
-        description: 'Optional Needle life area id.',
+        description: 'Optional TaskDeck life area id.',
       },
       lifeAreaName: {
         type: 'string',
         nullable: true,
-        description: 'Optional existing Needle life area name to attach the task to.',
+        description: 'Optional existing TaskDeck life area name to attach the task to.',
       },
     },
     required: ['confirmedByTom', 'title'],
@@ -826,11 +906,11 @@ const CREATE_NEEDLE_TASK_TOOL = {
   },
 };
 
-const UPDATE_NEEDLE_TASK_TOOL = {
+const UPDATE_TASKDECK_TASK_TOOL = {
   type: 'function',
-  name: 'update_needle_task',
+  name: 'update_taskdeck_task',
   description:
-    'Update a known Needle.AI task after Tom confirms the exact change, such as marking a task done.',
+    'Update a known TaskDeck task after Tom confirms the exact change, such as marking a task done.',
   parameters: {
     type: 'object',
     properties: {
@@ -838,7 +918,7 @@ const UPDATE_NEEDLE_TASK_TOOL = {
         type: 'boolean',
         description: 'Must be true only after Tom explicitly confirms the exact write.',
       },
-      taskId: { type: 'integer', description: 'Existing Needle task id.' },
+      taskId: { type: 'integer', description: 'Existing TaskDeck task id.' },
       title: { type: 'string', description: 'Optional replacement task title.' },
       status: {
         type: 'string',
@@ -866,22 +946,22 @@ const UPDATE_NEEDLE_TASK_TOOL = {
       projectId: {
         type: 'integer',
         nullable: true,
-        description: 'Optional existing Needle project id, or null to clear.',
+        description: 'Optional existing TaskDeck project id, or null to clear.',
       },
       projectName: {
         type: 'string',
         nullable: true,
-        description: 'Optional existing Needle project name.',
+        description: 'Optional existing TaskDeck project name.',
       },
       lifeAreaId: {
         type: 'integer',
         nullable: true,
-        description: 'Optional existing Needle life area id, or null to clear.',
+        description: 'Optional existing TaskDeck life area id, or null to clear.',
       },
       lifeAreaName: {
         type: 'string',
         nullable: true,
-        description: 'Optional existing Needle life area name.',
+        description: 'Optional existing TaskDeck life area name.',
       },
     },
     required: ['confirmedByTom', 'taskId'],
@@ -889,11 +969,11 @@ const UPDATE_NEEDLE_TASK_TOOL = {
   },
 };
 
-const CREATE_NEEDLE_CHECKIN_TOOL = {
+const CREATE_TASKDECK_CHECKIN_TOOL = {
   type: 'function',
-  name: 'create_needle_checkin',
+  name: 'create_taskdeck_checkin',
   description:
-    'Create a daily check-in in Tom\'s Needle.AI database after Tom confirms the captured check-in.',
+    'Create a daily check-in in Tom\'s TaskDeck database after Tom confirms the captured check-in.',
   parameters: {
     type: 'object',
     properties: {
@@ -919,11 +999,11 @@ const CREATE_NEEDLE_CHECKIN_TOOL = {
   },
 };
 
-const CREATE_NEEDLE_SITUATION_TOOL = {
+const CREATE_TASKDECK_SITUATION_TOOL = {
   type: 'function',
-  name: 'create_needle_situation',
+  name: 'create_taskdeck_situation',
   description:
-    'Create a new active Needle.AI situation after Tom confirms the title and urgency.',
+    'Create a new active TaskDeck situation after Tom confirms the title and urgency.',
   parameters: {
     type: 'object',
     properties: {
@@ -948,15 +1028,21 @@ const CREATE_NEEDLE_SITUATION_TOOL = {
   },
 };
 
-const NEEDLE_TOOLS = [
-  GET_NEEDLE_BRIEFING_TOOL,
-  CREATE_NEEDLE_TASK_TOOL,
-  UPDATE_NEEDLE_TASK_TOOL,
-  CREATE_NEEDLE_CHECKIN_TOOL,
-  CREATE_NEEDLE_SITUATION_TOOL,
+const TASKDECK_TOOLS = [
+  GET_TASKDECK_BRIEFING_TOOL,
+  CREATE_TASKDECK_TASK_TOOL,
+  UPDATE_TASKDECK_TASK_TOOL,
+  CREATE_TASKDECK_CHECKIN_TOOL,
+  CREATE_TASKDECK_SITUATION_TOOL,
 ];
 
-const REALTIME_TOOLS = [CAPTURE_MESSAGE_TOOL, ...NEEDLE_TOOLS];
+const CODEBASE_TOOLS = [
+  GET_CODEBASE_OVERVIEW_TOOL,
+  SEARCH_CODEBASE_TOOL,
+  READ_CODE_SNIPPET_TOOL,
+];
+
+const REALTIME_TOOLS = [CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL, ...TASKDECK_TOOLS, ...CODEBASE_TOOLS];
 
 const INVALID_PHONE_VALUES = new Set([
   '',
@@ -985,13 +1071,6 @@ const normalizeEmail = (value) => {
   if (!trimmed) return null;
   if (!trimmed.includes('@')) return null;
   return trimmed;
-};
-
-const normalizeMode = (value, fallback) => {
-  if (value === 'caller_message' || value === 'self_note') {
-    return value;
-  }
-  return fallback;
 };
 
 const normalizePriority = (value) => {
@@ -1038,12 +1117,16 @@ const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}
     instructions +=
       '\nCALL CONTEXT: Caller ID matches Tom\'s number. Default to self_note mode unless caller explicitly says otherwise.';
     instructions +=
-      '\nNEEDLE ACCESS: Because this is Tom, you may use Needle tools to read his private dashboard and, after explicit confirmation, create or update Needle records.';
+      '\nTASKDECK ACCESS: Because this is Tom, you may use TaskDeck tools to read his private dashboard and, after explicit confirmation, create or update TaskDeck records.';
+    instructions +=
+      '\nCODEBASE ACCESS: Because this is Tom, you may use read-only codebase tools to inspect the currently running voice-ai-system code when discussing how Victoria works or how to improve the system. Treat the code as deployed filesystem state, mention the git commit when helpful, and never request or reveal secrets, env files, credentials, or service-account material.';
   } else {
     instructions += `\nCALL OPENING: Use the public greeting exactly: "${ASSISTANT_GREETING}"`;
     instructions += '\nCALL CONTEXT: Treat this caller as an external contact unless clarified otherwise.';
     instructions +=
-      '\nNEEDLE ACCESS: Do not reveal, summarize, create, or update Tom\'s private Needle data for external callers.';
+      '\nTASKDECK ACCESS: Do not reveal, summarize, read, or update Tom\'s private TaskDeck data for external callers. The only allowed TaskDeck action for an external caller is creating a new caller-intake task from that caller\'s own confirmed message using create_taskdeck_caller_intake_task.';
+    instructions +=
+      '\nCODEBASE ACCESS: Do not reveal, summarize, or inspect Tom\'s private codebase for external callers.';
   }
 
   if (hasCallerPhone) {
@@ -1055,69 +1138,6 @@ const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}
 };
 
 const getOpeningGreeting = (isSelfCaller) => (isSelfCaller ? SELF_CALLER_GREETING : ASSISTANT_GREETING);
-
-const formatOutboundMessage = (payload, meta = {}) => {
-  const lines = [
-    'Voice Assistant Message',
-    `Mode: ${payload.mode}`,
-    `Priority: ${payload.priority}`,
-    `Callback requested: ${payload.callbackRequested ? 'yes' : 'no'}`,
-    `Subject: ${payload.subject}`,
-    `Message: ${payload.messageBody}`,
-  ];
-
-  if (payload.callerName) lines.push(`Caller name: ${payload.callerName}`);
-  if (payload.contactPhone) lines.push(`Contact phone: ${payload.contactPhone}`);
-  if (payload.contactEmail) lines.push(`Contact email: ${payload.contactEmail}`);
-  if (meta.callerPhone) lines.push(`Caller ID: ${meta.callerPhone}`);
-  if (meta.callSid) lines.push(`CallSid: ${meta.callSid}`);
-  if (meta.isSelfCaller != null) lines.push(`Self caller detected: ${meta.isSelfCaller ? 'yes' : 'no'}`);
-  if (meta.createdAt) lines.push(`Captured at: ${meta.createdAt}`);
-
-  return lines.join('\n');
-};
-
-// Firebase re-entry notes:
-// - Re-enable persistence by adding a storage adapter (for example Firestore) behind a single dispatch interface.
-// - Keep capture_message payload shape stable so storage and SMS can coexist without prompt/schema changes.
-// - If reactivating Firebase later, wire it via a separate module and call it from handleCaptureMessage.
-
-async function sendSmsToOwner(messageBody) {
-  const ownerPhone = normalizeCallerPhone(process.env.TWILIO_OWNER_PHONE);
-  const smsFrom = normalizeCallerPhone(process.env.TWILIO_SMS_FROM || process.env.PHONE_RELAY_NUMBER);
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-
-  if (!ownerPhone) {
-    return { delivered: false, channel: 'sms', reason: 'TWILIO_OWNER_PHONE missing' };
-  }
-  if (!smsFrom) {
-    return { delivered: false, channel: 'sms', reason: 'TWILIO_SMS_FROM missing' };
-  }
-  if (!accountSid || !authToken) {
-    return { delivered: false, channel: 'sms', reason: 'Twilio account credentials missing' };
-  }
-
-  try {
-    const client = twilio(accountSid, authToken);
-    const sms = await client.messages.create({
-      to: ownerPhone,
-      from: smsFrom,
-      body: messageBody,
-    });
-
-    return {
-      delivered: true,
-      channel: 'sms',
-      messageSid: sms.sid,
-      to: ownerPhone,
-      from: smsFrom,
-    };
-  } catch (err) {
-    console.error('[SMS] failed to send to owner', err);
-    return { delivered: false, channel: 'sms', reason: 'Twilio SMS send failed' };
-  }
-}
 
 export function attachRealtimeServer(server) {
   const wss = new WebSocketServer({ server, path: '/realtime' });
@@ -1147,9 +1167,9 @@ export function attachRealtimeServer(server) {
     let functionCallId = null;
     let inferredCallerPhone = null;
     let isSelfCaller = false;
-    let lastCapturedMessage = null;
-    let lastNeedleAction = null;
-    let messageDispatchStatus = null;
+    let lastCallerIntakeTask = null;
+    let lastTaskDeckAction = null;
+    let lastCodebaseAction = null;
     let callStartMs = Date.now();
     let callEndMs = null;
     let openaiReady = false;
@@ -1167,7 +1187,7 @@ export function attachRealtimeServer(server) {
 
     const ownerPhone = normalizeCallerPhone(process.env.TWILIO_OWNER_PHONE);
     if (!ownerPhone) {
-      console.warn('[Realtime] TWILIO_OWNER_PHONE is not set; SMS delivery will fail until configured');
+      console.warn('[Realtime] TWILIO_OWNER_PHONE is not set; self-caller detection is disabled until configured');
     }
 
     const resetFunctionCallState = () => {
@@ -1325,14 +1345,26 @@ export function attachRealtimeServer(server) {
       }
     };
 
-    const handleCaptureMessage = async (parsedArgs) => {
-      const fallbackMode = isSelfCaller ? 'self_note' : 'caller_message';
-      const mode = normalizeMode(parsedArgs?.mode, fallbackMode);
+    const handleCallerIntakeTask = async (parsedArgs) => {
+      if (isSelfCaller) {
+        sendFunctionOutput(
+          {
+            ok: false,
+            reason: 'use_taskdeck_task_tool',
+            message: 'Tom self-calls should use the regular TaskDeck task tools after Tom confirms the exact task.',
+          },
+          'create_taskdeck_caller_intake_task'
+        );
+        forceResponse('For your own notes, I should save this as a regular TaskDeck task. Summarize the exact task and ask Tom to confirm it.');
+        return;
+      }
+
+      const confirmedByCaller = normalizeBoolean(parsedArgs?.confirmedByCaller, false);
       const callerName = sanitizeText(parsedArgs?.callerName, 80);
       const contactPhone =
         normalizeCallerPhone(parsedArgs?.contactPhone) || normalizeCallerPhone(inferredCallerPhone) || null;
       const contactEmail = normalizeEmail(parsedArgs?.contactEmail);
-      const subject = sanitizeText(parsedArgs?.subject, 160) || (mode === 'self_note' ? 'Self note' : 'Voice message');
+      const subject = sanitizeText(parsedArgs?.subject, 160) || 'Voice message';
       const messageBody = sanitizeText(parsedArgs?.messageBody, 2000);
       const callbackRequested = normalizeBoolean(parsedArgs?.callbackRequested, false);
       const priority = normalizePriority(parsedArgs?.priority);
@@ -1343,7 +1375,7 @@ export function attachRealtimeServer(server) {
       }
 
       const payload = {
-        mode,
+        confirmedByCaller,
         callerName,
         contactPhone,
         contactEmail,
@@ -1353,45 +1385,82 @@ export function attachRealtimeServer(server) {
         priority,
       };
 
-      lastCapturedMessage = payload;
+      if (!confirmedByCaller) {
+        sendFunctionOutput(
+          {
+            ok: false,
+            reason: 'confirmation_required',
+          },
+          'create_taskdeck_caller_intake_task'
+        );
+        forceResponse('Summarize the exact message you would add to Tom\'s task list, then ask the caller to confirm.');
+        return;
+      }
 
-      const smsBody = formatOutboundMessage(payload, {
-        callSid,
-        callerPhone: normalizeCallerPhone(inferredCallerPhone),
-        isSelfCaller,
-        createdAt: new Date().toISOString(),
-      });
+      try {
+        const result = await createTaskDeckCallerIntakeTask({
+          ...payload,
+          callSid,
+          callerId: normalizeCallerPhone(inferredCallerPhone),
+          capturedAt: new Date().toISOString(),
+        });
 
-      const smsResult = await sendSmsToOwner(smsBody);
-      messageDispatchStatus = smsResult;
+        lastCallerIntakeTask = {
+          ok: Boolean(result?.ok),
+          reason: result?.reason || null,
+          taskId: result?.task?.id || null,
+          subject,
+          at: new Date().toISOString(),
+        };
 
-      sendFunctionOutput(
-        {
-          delivered: smsResult.delivered,
-          channel: 'sms',
-          reason: smsResult.reason || null,
-        },
-        'capture_message'
-      );
+        sendFunctionOutput(
+          {
+            ok: Boolean(result?.ok),
+            channel: 'taskdeck_task',
+            taskId: result?.task?.id || null,
+            reason: result?.reason || null,
+          },
+          'create_taskdeck_caller_intake_task'
+        );
 
-      if (smsResult.delivered) {
-        forceResponse('Thanks. I captured your message and passed it along to Tom.');
-      } else {
-        forceResponse('Thanks. I captured your message. Delivery may be delayed right now.');
+        if (result?.ok) {
+          forceResponse('Thanks. I added that to Tom\'s task list.');
+        } else {
+          forceResponse('I captured the details, but I could not add them to TaskDeck right now.');
+        }
+      } catch (err) {
+        console.warn('[TaskDeck] create_taskdeck_caller_intake_task failed', err);
+        lastCallerIntakeTask = {
+          ok: false,
+          reason: err?.message || 'Caller intake task failed',
+          taskId: null,
+          subject,
+          at: new Date().toISOString(),
+        };
+        sendFunctionOutput(
+          {
+            ok: false,
+            channel: 'taskdeck_task',
+            reason: 'taskdeck_caller_intake_error',
+            message: err?.message || 'Caller intake task failed.',
+          },
+          'create_taskdeck_caller_intake_task'
+        );
+        forceResponse('I captured the details, but I could not add them to TaskDeck right now.');
       }
     };
 
-    const handleNeedleTool = async (toolName, parsedArgs) => {
+    const handleCodebaseTool = async (toolName, parsedArgs) => {
       if (!isSelfCaller) {
         sendFunctionOutput(
           {
             ok: false,
             reason: 'not_authorized',
-            message: 'Needle data is private and only available when Tom is the caller.',
+            message: 'Codebase access is private and only available when Tom is the caller.',
           },
           toolName
         );
-        forceResponse('I can only access Tom\'s private Needle dashboard when I know I am speaking with Tom.');
+        forceResponse('I can only inspect Tom\'s codebase when I know I am speaking with Tom.');
         return;
       }
 
@@ -1399,26 +1468,87 @@ export function attachRealtimeServer(server) {
         let result;
 
         switch (toolName) {
-          case 'get_needle_briefing':
-            result = await getNeedleBriefing(parsedArgs);
+          case 'get_codebase_overview':
+            result = await getCodebaseOverview(parsedArgs);
             break;
-          case 'create_needle_task':
-            result = await createNeedleTask(parsedArgs);
+          case 'search_codebase':
+            result = await searchCodebase(parsedArgs);
             break;
-          case 'update_needle_task':
-            result = await updateNeedleTask(parsedArgs);
-            break;
-          case 'create_needle_checkin':
-            result = await createNeedleCheckIn(parsedArgs);
-            break;
-          case 'create_needle_situation':
-            result = await createNeedleSituation(parsedArgs);
+          case 'read_code_snippet':
+            result = await readCodeSnippet(parsedArgs);
             break;
           default:
-            result = { ok: false, reason: 'unsupported_needle_tool' };
+            result = { ok: false, reason: 'unsupported_codebase_tool' };
         }
 
-        lastNeedleAction = {
+        lastCodebaseAction = {
+          toolName,
+          ok: Boolean(result?.ok),
+          reason: result?.reason || null,
+          commit: result?.git?.shortCommit || null,
+          at: new Date().toISOString(),
+        };
+
+        sendFunctionOutput(result, toolName);
+        forceResponse('Use the codebase tool result to answer Tom directly and concisely. Mention that the view is read-only and currently deployed if that matters.');
+      } catch (err) {
+        console.warn(`[Codebase] ${toolName} failed`, err);
+        lastCodebaseAction = {
+          toolName,
+          ok: false,
+          reason: err?.message || 'Codebase tool failed',
+          at: new Date().toISOString(),
+        };
+        sendFunctionOutput(
+          {
+            ok: false,
+            reason: 'codebase_tool_error',
+            message: err?.message || 'Codebase tool failed.',
+          },
+          toolName
+        );
+        forceResponse('I could not inspect the codebase for that request. Briefly tell Tom what went wrong and suggest a narrower search or file path.');
+      }
+    };
+
+    const handleTaskDeckTool = async (toolName, parsedArgs) => {
+      if (!isSelfCaller) {
+        sendFunctionOutput(
+          {
+            ok: false,
+            reason: 'not_authorized',
+            message: 'TaskDeck data is private and only available when Tom is the caller.',
+          },
+          toolName
+        );
+        forceResponse('I can only access Tom\'s private TaskDeck dashboard when I know I am speaking with Tom.');
+        return;
+      }
+
+      try {
+        let result;
+
+        switch (toolName) {
+          case 'get_taskdeck_briefing':
+            result = await getTaskDeckBriefing(parsedArgs);
+            break;
+          case 'create_taskdeck_task':
+            result = await createTaskDeckTask(parsedArgs);
+            break;
+          case 'update_taskdeck_task':
+            result = await updateTaskDeckTask(parsedArgs);
+            break;
+          case 'create_taskdeck_checkin':
+            result = await createTaskDeckCheckIn(parsedArgs);
+            break;
+          case 'create_taskdeck_situation':
+            result = await createTaskDeckSituation(parsedArgs);
+            break;
+          default:
+            result = { ok: false, reason: 'unsupported_taskdeck_tool' };
+        }
+
+        lastTaskDeckAction = {
           toolName,
           ok: Boolean(result?.ok),
           reason: result?.reason || null,
@@ -1427,39 +1557,39 @@ export function attachRealtimeServer(server) {
 
         sendFunctionOutput(result, toolName);
 
-        if (toolName === 'get_needle_briefing') {
-          forceResponse('Use the Needle tool result to answer Tom directly and concisely. Mention task or project ids only if they help with a follow-up change.');
+        if (toolName === 'get_taskdeck_briefing') {
+          forceResponse('Use the TaskDeck tool result to answer Tom directly and concisely. Mention task or project ids only if they help with a follow-up change.');
           return;
         }
 
         if (result?.ok === false && result?.reason === 'confirmation_required') {
-          forceResponse('Before I change Needle, summarize the exact change and ask Tom to confirm it.');
+          forceResponse('Before I change TaskDeck, summarize the exact change and ask Tom to confirm it.');
           return;
         }
 
         if (result?.ok) {
-          forceResponse('Briefly confirm the Needle change that was completed, using the tool result for exact names or ids.');
+          forceResponse('Briefly confirm the TaskDeck change that was completed, using the tool result for exact names or ids.');
           return;
         }
 
-        forceResponse('Tell Tom the Needle change was not completed and briefly explain why.');
+        forceResponse('Tell Tom the TaskDeck change was not completed and briefly explain why.');
       } catch (err) {
-        console.warn(`[Needle] ${toolName} failed`, err);
-        lastNeedleAction = {
+        console.warn(`[TaskDeck] ${toolName} failed`, err);
+        lastTaskDeckAction = {
           toolName,
           ok: false,
-          reason: err?.message || 'Needle tool failed',
+          reason: err?.message || 'TaskDeck tool failed',
           at: new Date().toISOString(),
         };
         sendFunctionOutput(
           {
             ok: false,
-            reason: 'needle_tool_error',
-            message: err?.message || 'Needle tool failed.',
+            reason: 'taskdeck_tool_error',
+            message: err?.message || 'TaskDeck tool failed.',
           },
           toolName
         );
-        forceResponse('I could not complete that Needle request. Briefly tell Tom what went wrong and ask what he wants to do next.');
+        forceResponse('I could not complete that TaskDeck request. Briefly tell Tom what went wrong and ask what he wants to do next.');
       }
     };
 
@@ -1472,14 +1602,20 @@ export function attachRealtimeServer(server) {
       try {
         const parsedArgs = JSON.parse(functionCallBuffer);
 
-        if (functionCallName === 'capture_message') {
-          await handleCaptureMessage(parsedArgs);
+        if (functionCallName === 'create_taskdeck_caller_intake_task') {
+          await handleCallerIntakeTask(parsedArgs);
           resetFunctionCallState();
           return;
         }
 
-        if (NEEDLE_TOOLS.some((tool) => tool.name === functionCallName)) {
-          await handleNeedleTool(functionCallName, parsedArgs);
+        if (TASKDECK_TOOLS.some((tool) => tool.name === functionCallName)) {
+          await handleTaskDeckTool(functionCallName, parsedArgs);
+          resetFunctionCallState();
+          return;
+        }
+
+        if (CODEBASE_TOOLS.some((tool) => tool.name === functionCallName)) {
+          await handleCodebaseTool(functionCallName, parsedArgs);
           resetFunctionCallState();
           return;
         }
@@ -1684,11 +1820,9 @@ export function attachRealtimeServer(server) {
         callSid,
         callerPhone,
         isSelfCaller,
-        capturedMode: lastCapturedMessage?.mode || null,
-        capturedSubject: lastCapturedMessage?.subject || null,
-        lastNeedleAction,
-        messageDelivered: messageDispatchStatus?.delivered || false,
-        deliveryReason: messageDispatchStatus?.reason || null,
+        callerIntakeTask: lastCallerIntakeTask,
+        lastTaskDeckAction,
+        lastCodebaseAction,
         callDurationSeconds,
         openaiUsageTotals,
       });

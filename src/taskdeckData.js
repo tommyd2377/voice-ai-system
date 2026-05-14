@@ -6,7 +6,8 @@ import { createClient } from '@libsql/client';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DEFAULT_LOCAL_NEEDLE_DB = path.resolve(__dirname, '../../needle.ai/data/needle.db');
+const DEFAULT_LOCAL_TASKDECK_DB = path.resolve(__dirname, '../../taskdeck/data/taskdeck.db');
+const LEGACY_LOCAL_NEEDLE_DB = path.resolve(__dirname, '../../needle.ai/data/needle.db');
 const DEFAULT_TIMEZONE = 'America/New_York';
 const MAX_LIMIT = 25;
 
@@ -91,21 +92,37 @@ const enumValue = (value, allowed, fallback, name) => {
   throw new Error(`${name} must be one of: ${allowed.join(', ')}.`);
 };
 
+const booleanValue = (value, fallback = false) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const lower = value.toLowerCase();
+    if (lower === 'true' || lower === 'yes') return true;
+    if (lower === 'false' || lower === 'no') return false;
+  }
+  return fallback;
+};
+
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
 
-export function getNeedleDatabaseUrl() {
-  const configured = process.env.NEEDLE_DATABASE_URL || process.env.DATABASE_URL;
+export function getTaskDeckDatabaseUrl() {
+  const configured = process.env.TASKDECK_DATABASE_URL || process.env.NEEDLE_DATABASE_URL || process.env.DATABASE_URL;
   if (configured) return configured;
 
-  if (existsSync(DEFAULT_LOCAL_NEEDLE_DB)) {
-    return `file:${DEFAULT_LOCAL_NEEDLE_DB}`;
+  if (existsSync(DEFAULT_LOCAL_TASKDECK_DB)) {
+    return `file:${DEFAULT_LOCAL_TASKDECK_DB}`;
+  }
+
+  if (existsSync(LEGACY_LOCAL_NEEDLE_DB)) {
+    return `file:${LEGACY_LOCAL_NEEDLE_DB}`;
   }
 
   return null;
 }
 
-function getNeedleAuthToken() {
+function getTaskDeckAuthToken() {
   return (
+    process.env.TASKDECK_DATABASE_AUTH_TOKEN ||
+    process.env.TASKDECK_TURSO_AUTH_TOKEN ||
     process.env.NEEDLE_DATABASE_AUTH_TOKEN ||
     process.env.NEEDLE_TURSO_AUTH_TOKEN ||
     process.env.TURSO_AUTH_TOKEN ||
@@ -115,15 +132,15 @@ function getNeedleAuthToken() {
 }
 
 function getClient() {
-  const databaseUrl = getNeedleDatabaseUrl();
+  const databaseUrl = getTaskDeckDatabaseUrl();
   if (!databaseUrl) {
-    throw new Error('NEEDLE_DATABASE_URL is not configured and the local Needle database was not found.');
+    throw new Error('TASKDECK_DATABASE_URL is not configured and the local TaskDeck database was not found.');
   }
 
   if (!client) {
     client = createClient({
       url: databaseUrl,
-      authToken: getNeedleAuthToken(),
+      authToken: getTaskDeckAuthToken(),
     });
   }
 
@@ -166,7 +183,7 @@ async function resolveLifeAreaId({ lifeAreaId, lifeAreaName } = {}) {
   if (lifeAreaId != null && lifeAreaId !== '') {
     const id = positiveInteger(lifeAreaId, 'lifeAreaId');
     const lifeArea = await first('SELECT id FROM life_areas WHERE id = ?', [id]);
-    if (!lifeArea) throw new Error(`No Needle life area exists with id ${id}.`);
+    if (!lifeArea) throw new Error(`No TaskDeck life area exists with id ${id}.`);
     return id;
   }
 
@@ -177,7 +194,7 @@ async function resolveLifeAreaId({ lifeAreaId, lifeAreaName } = {}) {
     'SELECT id FROM life_areas WHERE name = ? COLLATE NOCASE LIMIT 1',
     [name]
   );
-  if (!lifeArea) throw new Error(`No Needle life area exists named "${name}".`);
+  if (!lifeArea) throw new Error(`No TaskDeck life area exists named "${name}".`);
   return lifeArea.id;
 }
 
@@ -185,7 +202,7 @@ async function resolveProject({ projectId, projectName } = {}) {
   if (projectId != null && projectId !== '') {
     const id = positiveInteger(projectId, 'projectId');
     const project = await first('SELECT id, life_area_id FROM projects WHERE id = ?', [id]);
-    if (!project) throw new Error(`No Needle project exists with id ${id}.`);
+    if (!project) throw new Error(`No TaskDeck project exists with id ${id}.`);
     return project;
   }
 
@@ -196,7 +213,7 @@ async function resolveProject({ projectId, projectName } = {}) {
     'SELECT id, life_area_id FROM projects WHERE name = ? COLLATE NOCASE LIMIT 1',
     [name]
   );
-  if (!project) throw new Error(`No Needle project exists named "${name}".`);
+  if (!project) throw new Error(`No TaskDeck project exists named "${name}".`);
   return project;
 }
 
@@ -216,7 +233,7 @@ async function getTask(taskId) {
   );
 }
 
-export async function getNeedleBriefing(input = {}) {
+export async function getTaskDeckBriefing(input = {}) {
   const topic = enumValue(
     input.topic,
     ['everything', 'tasks', 'projects', 'situations', 'today', 'memory'],
@@ -366,7 +383,7 @@ export async function getNeedleBriefing(input = {}) {
   };
 }
 
-export async function createNeedleTask(input = {}) {
+export async function createTaskDeckTask(input = {}) {
   if (input.confirmedByTom !== true) {
     return { ok: false, reason: 'confirmation_required' };
   }
@@ -408,14 +425,68 @@ export async function createNeedleTask(input = {}) {
   };
 }
 
-export async function updateNeedleTask(input = {}) {
+export async function createTaskDeckCallerIntakeTask(input = {}) {
+  if (input.confirmedByCaller !== true) {
+    return { ok: false, reason: 'confirmation_required' };
+  }
+
+  const subject = textOrDefault(input.subject, 'Voice message', 160);
+  const messageBody = textOrDefault(input.messageBody, '', 5000);
+  if (!messageBody) throw new Error('messageBody is required.');
+
+  const callerName = nullableText(input.callerName, 80);
+  const contactPhone = nullableText(input.contactPhone, 80);
+  const contactEmail = nullableText(input.contactEmail, 160);
+  const callerId = nullableText(input.callerId, 80);
+  const callSid = nullableText(input.callSid, 120);
+  const capturedAt = nullableText(input.capturedAt, 80) || nowIso();
+  const callbackRequested = booleanValue(input.callbackRequested, false);
+  const priority = enumValue(input.priority, ['low', 'normal', 'high'], 'normal', 'priority');
+  const importanceByPriority = { low: 2, normal: 3, high: 4 };
+  const now = nowIso();
+
+  const titlePrefix = callerName ? `Follow up with ${callerName}` : 'Caller message';
+  const title = textOrDefault(`${titlePrefix}: ${subject}`, 'Caller message', 220);
+  const notes = [
+    'Caller intake captured by Victoria.',
+    `Subject: ${subject}`,
+    `Priority: ${priority}`,
+    `Callback requested: ${callbackRequested ? 'yes' : 'no'}`,
+    callerName ? `Caller name: ${callerName}` : null,
+    contactPhone ? `Contact phone: ${contactPhone}` : null,
+    contactEmail ? `Contact email: ${contactEmail}` : null,
+    callerId ? `Caller ID: ${callerId}` : null,
+    callSid ? `CallSid: ${callSid}` : null,
+    `Captured at: ${capturedAt}`,
+    '',
+    'Message:',
+    messageBody,
+  ]
+    .filter((line) => line != null)
+    .join('\n');
+
+  const taskId = await insert(
+    `INSERT INTO tasks (
+      title, life_area_id, project_id, status, importance, effort, due_date, notes, created_at, updated_at
+    ) VALUES (?, NULL, NULL, 'open', ?, 2, NULL, ?, ?, ?)`,
+    [title, importanceByPriority[priority], notes, now, now]
+  );
+
+  return {
+    ok: true,
+    channel: 'taskdeck_task',
+    task: await getTask(taskId),
+  };
+}
+
+export async function updateTaskDeckTask(input = {}) {
   if (input.confirmedByTom !== true) {
     return { ok: false, reason: 'confirmation_required' };
   }
 
   const taskId = positiveInteger(input.taskId, 'taskId');
   const existing = await getTask(taskId);
-  if (!existing) throw new Error(`No Needle task exists with id ${taskId}.`);
+  if (!existing) throw new Error(`No TaskDeck task exists with id ${taskId}.`);
 
   const updates = [];
   const args = [];
@@ -484,7 +555,7 @@ export async function updateNeedleTask(input = {}) {
   };
 }
 
-export async function createNeedleCheckIn(input = {}) {
+export async function createTaskDeckCheckIn(input = {}) {
   if (input.confirmedByTom !== true) {
     return { ok: false, reason: 'confirmation_required' };
   }
@@ -517,7 +588,7 @@ export async function createNeedleCheckIn(input = {}) {
   };
 }
 
-export async function createNeedleSituation(input = {}) {
+export async function createTaskDeckSituation(input = {}) {
   if (input.confirmedByTom !== true) {
     return { ok: false, reason: 'confirmation_required' };
   }
@@ -546,7 +617,7 @@ export async function createNeedleSituation(input = {}) {
     VALUES (?, 'assistant', ?, ?)`,
     [
       sessionId,
-      'What do you most want to change about this situation, and what would feel meaningfully different if Needle helped you make progress?',
+      'What do you most want to change about this situation, and what would feel meaningfully different if TaskDeck helped you make progress?',
       now,
     ]
   );
