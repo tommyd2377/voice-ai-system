@@ -10,6 +10,7 @@ import {
 
 const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
 const ASSISTANT_GREETING = "Hey, I'm Victoria, Tom's AI assistant. How can I help you today?";
+const SELF_CALLER_GREETING = "Hey Tom, what's up?";
 
 const BASE_INSTRUCTIONS = `
 You are Victoria, the personal AI assistant and operator for Thomas DeVito.
@@ -1033,11 +1034,13 @@ const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}
   let instructions = BASE_INSTRUCTIONS;
 
   if (isSelfCaller) {
+    instructions += `\nCALL OPENING OVERRIDE: Caller ID matches Tom's number. Start this call by saying exactly: "${SELF_CALLER_GREETING}"`;
     instructions +=
       '\nCALL CONTEXT: Caller ID matches Tom\'s number. Default to self_note mode unless caller explicitly says otherwise.';
     instructions +=
       '\nNEEDLE ACCESS: Because this is Tom, you may use Needle tools to read his private dashboard and, after explicit confirmation, create or update Needle records.';
   } else {
+    instructions += `\nCALL OPENING: Use the public greeting exactly: "${ASSISTANT_GREETING}"`;
     instructions += '\nCALL CONTEXT: Treat this caller as an external contact unless clarified otherwise.';
     instructions +=
       '\nNEEDLE ACCESS: Do not reveal, summarize, create, or update Tom\'s private Needle data for external callers.';
@@ -1050,6 +1053,8 @@ const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}
 
   return instructions;
 };
+
+const getOpeningGreeting = (isSelfCaller) => (isSelfCaller ? SELF_CALLER_GREETING : ASSISTANT_GREETING);
 
 const formatOutboundMessage = (payload, meta = {}) => {
   const lines = [
@@ -1284,7 +1289,7 @@ export function attachRealtimeServer(server) {
         JSON.stringify({
           type: 'response.create',
           response: {
-            instructions: `Start the call by saying exactly: ${ASSISTANT_GREETING}`,
+            instructions: `Start the call by saying exactly: ${getOpeningGreeting(isSelfCaller)}`,
           },
         })
       );
