@@ -1,17 +1,17 @@
 # Voice AI System
 
-A Node.js voice assistant backend that connects live Twilio phone calls to the OpenAI Realtime API, runs a persona-driven assistant (Victoria), captures confirmed caller messages as TaskDeck tasks, and can act as a voice interface for Tom's private TaskDeck.AI database.
+A Node.js voice assistant backend that connects live Twilio phone calls to the OpenAI Realtime API, runs a persona-driven assistant (Victoria), captures confirmed caller messages as Flowpath tasks, and can act as a voice interface for Tom's private Flowpath database.
 
 ## System Purpose
 
 This system is built for three primary call flows:
 - External callers can ask about Tom's background, work, and technical skills, then leave a structured message.
 - Tom can call his own number to leave himself a quick voice note.
-- Tom can ask Victoria about TaskDeck.AI tasks, projects, situations, check-ins, plans, and create/update selected TaskDeck records by voice.
+- Tom can ask Victoria about Flowpath tasks, projects, situations, check-ins, plans, and create/update selected Flowpath records by voice.
 
-When an external caller confirms a message, Victoria calls a narrow tool (`create_taskdeck_caller_intake_task`) that creates a new open TaskDeck task from that caller's own message.
+When an external caller confirms a message, Victoria calls a narrow legacy-named tool (`create_taskdeck_caller_intake_task`) that creates a new open Flowpath task from that caller's own message.
 
-When Tom is the caller, Victoria can also call scoped TaskDeck tools backed by the same libSQL database used by the TaskDeck Next.js app. External callers are not allowed to read, search, update, or attach to private TaskDeck data.
+When Tom is the caller, Victoria can also call scoped Flowpath tools backed by the same libSQL database used by the Flowpath Next.js app. External callers are not allowed to read, search, update, or attach to private Flowpath data.
 
 ## Languages and Core Technologies
 
@@ -43,7 +43,7 @@ When Tom is the caller, Victoria can also call scoped TaskDeck tools backed by t
 - `src/server.js`
 - `src/realtimeHandler.js`
 - `ws`, `express`, `dotenv`
-- `@libsql/client` for shared TaskDeck.AI database access
+- `@libsql/client` for shared Flowpath database access
 
 ### Present but currently dormant or unused
 - `src/firebase.js` and `firebase-admin` dependency (not in active call path)
@@ -62,7 +62,7 @@ flowchart LR
   F --> G[OpenAI Realtime API gpt-realtime-2]
   G --> F
   F --> E
-  F --> J[TaskDeck.AI libSQL database]
+  F --> J[Flowpath libSQL database]
 ```
 
 ## End-to-End Call Flow
@@ -75,7 +75,7 @@ flowchart LR
 6. OpenAI returns response audio deltas; bridge forwards them back to Twilio.
 7. On user barge-in, the bridge sends Twilio `clear` and OpenAI `response.cancel`.
 8. When Victoria confirms an external caller message, the model calls `create_taskdeck_caller_intake_task`.
-9. When Tom asks about TaskDeck, model calls scoped TaskDeck read/write tools.
+9. When Tom asks about Flowpath, model calls scoped Flowpath read/write tools.
 10. Bridge validates/normalizes payloads, performs scoped database operations, then returns tool output.
 11. Assistant confirms success/failure to the caller and logs a concise call summary.
 
@@ -90,7 +90,7 @@ flowchart LR
 `attachRealtimeServer()` manages:
 - Twilio stream lifecycle (`start`, `media`, `mark`, `stop`, close/error)
 - OpenAI lifecycle (`session.*`, `response.*`, function call deltas)
-- Function-call assembly for TaskDeck caller-intake and private self-call tools
+- Function-call assembly for Flowpath caller-intake and private self-call tools
 - Usage accounting (`input/output/audio/cached token` aggregates)
 
 ## Tool Contract: `create_taskdeck_caller_intake_task`
@@ -107,11 +107,11 @@ The assistant uses this external-caller-safe function tool:
 
 Behavior notes:
 - Missing contact phone falls back to caller ID when available.
-- The tool only creates a new open TaskDeck task.
-- The tool does not read, search, update, or attach to private TaskDeck records.
+- The tool only creates a new open Flowpath task.
+- The tool does not read, search, update, or attach to private Flowpath records.
 - Tool output includes `{ ok, channel: "taskdeck_task", taskId?, reason? }`.
 
-## TaskDeck.AI Tool Contracts
+## Flowpath Tool Contracts
 
 Victoria can use these tools only for self-calls, determined by caller ID matching `TWILIO_OWNER_PHONE`:
 
@@ -123,13 +123,15 @@ Victoria can use these tools only for self-calls, determined by caller ID matchi
 
 External callers get only `create_taskdeck_caller_intake_task`, which inserts a standalone task from their confirmed message and returns only a minimal result.
 
-Victoria does not receive arbitrary SQL access. The voice service is a client of TaskDeck's existing database, not the owner of TaskDeck's schema or migrations.
+Victoria does not receive arbitrary SQL access. The voice service is a client of Flowpath's existing database, not the owner of Flowpath's schema or migrations.
+
+The runtime function names still use `taskdeck_*` for compatibility, but Victoria is instructed to treat and describe them as Flowpath tools.
 
 ## Directory Map
 
 - `src/server.js`: Express endpoints, TwiML response, server bootstrap
-- `src/realtimeHandler.js`: Twilio/OpenAI realtime bridge, prompt/instructions, TaskDeck caller intake
-- `src/taskdeckData.js`: scoped TaskDeck.AI database adapter for read/write voice tools
+- `src/realtimeHandler.js`: Twilio/OpenAI realtime bridge, prompt/instructions, Flowpath caller intake
+- `src/taskdeckData.js`: scoped Flowpath database adapter for read/write voice tools
 - `src/twilioWebhook.js`: Alternate Twilio webhook helper (currently not wired)
 - `src/firebase.js`: Dormant Firebase admin initialization (not used in active flow)
 - `.env.example`: runtime configuration template
@@ -140,18 +142,20 @@ Victoria does not receive arbitrary SQL access. The voice service is a client of
 - `OPENAI_API_KEY`
 - `TWILIO_STREAM_URL`
 
-### Required for Tom/self-caller private TaskDeck access
+### Required for Tom/self-caller private Flowpath access
 - `TWILIO_OWNER_PHONE`
 
-### Required for deployed TaskDeck.AI voice access
-- `TASKDECK_DATABASE_URL` (same libSQL/Turso database used by TaskDeck)
-- `TASKDECK_DATABASE_AUTH_TOKEN` if the shared database requires auth
+### Required for deployed Flowpath voice access
+- `FLOWPATH_DATABASE_URL` (same libSQL/Turso database used by Flowpath)
+- `FLOWPATH_DATABASE_AUTH_TOKEN` if the shared database requires auth
 
-For local development, the voice service auto-detects the sibling TaskDeck database at `../taskdeck/data/taskdeck.db` when present. You can also set:
+For local development, the voice service auto-detects the sibling Flowpath database at `../flowpath/data/flowpath.db` when present. You can also set:
 
 ```bash
-TASKDECK_DATABASE_URL=file:/Users/thomasdevito/Projects/taskdeck/data/taskdeck.db
+FLOWPATH_DATABASE_URL=file:/Users/thomasdevito/Projects/flowpath/data/flowpath.db
 ```
+
+Legacy `TASKDECK_*` and `NEEDLE_*` database environment variables and local database paths are still accepted as fallbacks.
 
 ### Optional
 - `OPENAI_REALTIME_ENDPOINT` (runtime forces model query param to `gpt-realtime-2`)
@@ -189,8 +193,8 @@ curl http://localhost:8080/health
 
 ## Operational Notes
 
-- External caller messages are persisted as standalone open TaskDeck tasks after caller confirmation.
-- If TaskDeck database access is unavailable, voice conversation still works but caller-intake task creation fails.
+- External caller messages are persisted as standalone open Flowpath tasks after caller confirmation.
+- If Flowpath database access is unavailable, voice conversation still works but caller-intake task creation fails.
 - Firebase can be reintroduced later through a storage adapter path without changing call transport architecture.
 
 ## Troubleshooting
@@ -198,4 +202,4 @@ curl http://localhost:8080/health
 - `TWILIO_STREAM_URL not configured`: set `TWILIO_STREAM_URL` in `.env`.
 - OpenAI connection fails: verify `OPENAI_API_KEY` and network egress.
 - Tom is not recognized as self-caller: verify `TWILIO_OWNER_PHONE` matches the caller ID format.
-- Assistant talks but cannot create caller task: check TaskDeck database env vars and logs for `create_taskdeck_caller_intake_task`.
+- Assistant talks but cannot create caller task: check Flowpath database env vars and logs for `create_taskdeck_caller_intake_task`.

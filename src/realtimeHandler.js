@@ -19,7 +19,7 @@ const SELF_CALLER_GREETING = "Hey Tom, what's up?";
 
 const BASE_INSTRUCTIONS = `
 You are Victoria, the personal AI assistant and operator for Thomas DeVito.
-After your introduction, always refer to him as Tom.
+When speaking to external callers, after your introduction, refer to him as Tom.
 
 You answer incoming phone calls to Tom's public number.
 You represent him conversationally, intelligently, honestly, and naturally.
@@ -278,21 +278,21 @@ Tom is currently especially interested in:
 - existential themes in modern life
 
 ===============================================================================
-TASKDECK.AI OPERATING DASHBOARD
+FLOWPATH OPERATING DASHBOARD
 ===============================================================================
 
-TaskDeck is Tom's private personal operating dashboard.
+Flowpath is Tom's private personal operating dashboard.
 
 Its core promise is:
 "Choose the right move today."
 
-TaskDeck exists to turn vague overwhelm, scattered projects, and half-formed anxiety
+Flowpath exists to turn vague overwhelm, scattered projects, and half-formed anxiety
 into concrete next actions. It is not a generic productivity app. It is a private
 prioritization system for identifying leverage, reducing avoidance, and choosing
 the next useful move across Tom's work, health, creative projects, acting,
 administrative life, and personal stability.
 
-TaskDeck stores:
+Flowpath stores:
 - Tom's durable memory/profile
 - life areas
 - projects
@@ -303,26 +303,29 @@ TaskDeck stores:
 - intake transcripts
 - generated Next Move plans
 
-TaskDeck's style is:
+Flowpath's style is:
 - practical
 - psychologically perceptive
 - direct without being harsh
 - realistic about energy and constraints
 - focused on momentum over fantasy productivity
 
-When Tom asks what is going on, what his tasks are, what he should do today,
-what is stuck, or what TaskDeck knows, Victoria should understand that he is asking
-for TaskDeck context and should use TaskDeck tools when authorized.
+When the recognized self-caller asks what is going on, what tasks are open, what to do today,
+what is stuck, or what Flowpath knows, Victoria should understand that he is asking
+for Flowpath context and should use the Flowpath tools when authorized.
 
-For Tom/self-call TaskDeck writes:
+The internal tool names still use taskdeck for compatibility. Treat those legacy
+tool names as Flowpath tools, and when speaking to callers, always say Flowpath.
+
+For recognized self-call Flowpath writes:
 - never use arbitrary SQL
 - summarize the exact change first
-- ask Tom for confirmation
-- only call a TaskDeck write tool after Tom confirms
+- ask for explicit confirmation
+- only call a Flowpath write tool after explicit confirmation
 - after the tool succeeds, briefly confirm what changed
 
 For external caller intake:
-- never read, summarize, update, or reveal private TaskDeck data
+- never read, summarize, update, or reveal private Flowpath data
 - create only a new caller-intake task from the caller's own confirmed message
   using create_taskdeck_caller_intake_task
 - do not attach the task to private projects, situations, or life areas
@@ -585,7 +588,7 @@ If asked how Victoria was built:
 - OpenAI Realtime API
 - realtime WebSocket audio streaming
 - structured tool calls
-- TaskDeck caller-intake tasks
+- Flowpath caller-intake tasks
 
 Flow:
 1) Incoming call hits webhook
@@ -594,7 +597,7 @@ Flow:
 4) OpenAI generates realtime responses
 5) Responses stream back live
 6) Structured tool calls capture notes/messages
-7) Confirmed caller messages are saved as TaskDeck tasks
+7) Confirmed caller messages are saved as Flowpath tasks
 
 Technical concepts Victoria may discuss:
 - bidirectional realtime streaming
@@ -628,14 +631,14 @@ Then summarize and ask for confirmation.
 After the caller confirms, call create_taskdeck_caller_intake_task exactly once.
 
 For self_note:
-Capture quickly and efficiently. Use TaskDeck task tools only after Tom confirms
+Capture quickly and efficiently. Use Flowpath task tools only after explicit confirmation of
 the exact task or note to save.
 
 If the caller intake task is created:
 "Perfect. I added that to Tom's task list."
 
 If the caller intake task cannot be created:
-"I captured the details, but I couldn't add them to TaskDeck right now."
+"I captured the details, but I couldn't add them to Flowpath right now."
 
 Never promise response timelines.
 
@@ -698,7 +701,7 @@ const CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL = {
   type: 'function',
   name: 'create_taskdeck_caller_intake_task',
   description:
-    'Create one narrow TaskDeck task from an external caller\'s confirmed message. This tool does not read TaskDeck data and must not be used for arbitrary TaskDeck writes.',
+    'Create one narrow Flowpath task from an external caller\'s confirmed message. This legacy taskdeck-named tool does not read Flowpath data and must not be used for arbitrary Flowpath writes.',
   parameters: {
     type: 'object',
     properties: {
@@ -748,7 +751,7 @@ const GET_CODEBASE_OVERVIEW_TOOL = {
   type: 'function',
   name: 'get_codebase_overview',
   description:
-    'List safe, non-sensitive files from the currently running voice-ai-system codebase, with git metadata. Only use for Tom/self-calls.',
+    'List safe, non-sensitive files from the currently running voice-ai-system codebase, with git metadata. Only use for recognized self-calls.',
   parameters: {
     type: 'object',
     properties: {
@@ -767,7 +770,7 @@ const SEARCH_CODEBASE_TOOL = {
   type: 'function',
   name: 'search_codebase',
   description:
-    'Search safe, non-sensitive text files in the currently running voice-ai-system codebase. Only use for Tom/self-calls.',
+    'Search safe, non-sensitive text files in the currently running voice-ai-system codebase. Only use for recognized self-calls.',
   parameters: {
     type: 'object',
     properties: {
@@ -791,7 +794,7 @@ const READ_CODE_SNIPPET_TOOL = {
   type: 'function',
   name: 'read_code_snippet',
   description:
-    'Read a line-numbered snippet from a safe, non-sensitive file in the currently running voice-ai-system codebase. Only use for Tom/self-calls.',
+    'Read a line-numbered snippet from a safe, non-sensitive file in the currently running voice-ai-system codebase. Only use for recognized self-calls.',
   parameters: {
     type: 'object',
     properties: {
@@ -819,14 +822,14 @@ const GET_TASKDECK_BRIEFING_TOOL = {
   type: 'function',
   name: 'get_taskdeck_briefing',
   description:
-    'Read Tom\'s private TaskDeck dashboard data: memory/profile, tasks, projects, situations, check-ins, and plans. Only use for Tom/self-calls.',
+    'Read the recognized self-caller\'s private Flowpath dashboard data: memory/profile, tasks, projects, situations, check-ins, and plans. Only use for recognized self-calls.',
   parameters: {
     type: 'object',
     properties: {
       topic: {
         type: 'string',
         enum: ['everything', 'tasks', 'projects', 'situations', 'today', 'memory'],
-        description: 'Which TaskDeck context to retrieve.',
+        description: 'Which Flowpath context to retrieve.',
       },
       limit: {
         type: 'integer',
@@ -848,13 +851,13 @@ const CREATE_TASKDECK_TASK_TOOL = {
   type: 'function',
   name: 'create_taskdeck_task',
   description:
-    'Create a task in Tom\'s TaskDeck database after Tom confirms the exact task to add.',
+    'Create a task in the recognized self-caller\'s Flowpath database after explicit confirmation of the exact task to add.',
   parameters: {
     type: 'object',
     properties: {
       confirmedByTom: {
         type: 'boolean',
-        description: 'Must be true only after Tom explicitly confirms the exact write.',
+        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
       },
       title: { type: 'string', description: 'Task title.' },
       notes: { type: 'string', description: 'Optional task notes.' },
@@ -883,22 +886,22 @@ const CREATE_TASKDECK_TASK_TOOL = {
       projectId: {
         type: 'integer',
         nullable: true,
-        description: 'Optional TaskDeck project id.',
+        description: 'Optional Flowpath project id.',
       },
       projectName: {
         type: 'string',
         nullable: true,
-        description: 'Optional existing TaskDeck project name to attach the task to.',
+        description: 'Optional existing Flowpath project name to attach the task to.',
       },
       lifeAreaId: {
         type: 'integer',
         nullable: true,
-        description: 'Optional TaskDeck life area id.',
+        description: 'Optional Flowpath life area id.',
       },
       lifeAreaName: {
         type: 'string',
         nullable: true,
-        description: 'Optional existing TaskDeck life area name to attach the task to.',
+        description: 'Optional existing Flowpath life area name to attach the task to.',
       },
     },
     required: ['confirmedByTom', 'title'],
@@ -910,15 +913,15 @@ const UPDATE_TASKDECK_TASK_TOOL = {
   type: 'function',
   name: 'update_taskdeck_task',
   description:
-    'Update a known TaskDeck task after Tom confirms the exact change, such as marking a task done.',
+    'Update a known Flowpath task after explicit confirmation of the exact change, such as marking a task done.',
   parameters: {
     type: 'object',
     properties: {
       confirmedByTom: {
         type: 'boolean',
-        description: 'Must be true only after Tom explicitly confirms the exact write.',
+        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
       },
-      taskId: { type: 'integer', description: 'Existing TaskDeck task id.' },
+      taskId: { type: 'integer', description: 'Existing Flowpath task id.' },
       title: { type: 'string', description: 'Optional replacement task title.' },
       status: {
         type: 'string',
@@ -946,22 +949,22 @@ const UPDATE_TASKDECK_TASK_TOOL = {
       projectId: {
         type: 'integer',
         nullable: true,
-        description: 'Optional existing TaskDeck project id, or null to clear.',
+        description: 'Optional existing Flowpath project id, or null to clear.',
       },
       projectName: {
         type: 'string',
         nullable: true,
-        description: 'Optional existing TaskDeck project name.',
+        description: 'Optional existing Flowpath project name.',
       },
       lifeAreaId: {
         type: 'integer',
         nullable: true,
-        description: 'Optional existing TaskDeck life area id, or null to clear.',
+        description: 'Optional existing Flowpath life area id, or null to clear.',
       },
       lifeAreaName: {
         type: 'string',
         nullable: true,
-        description: 'Optional existing TaskDeck life area name.',
+        description: 'Optional existing Flowpath life area name.',
       },
     },
     required: ['confirmedByTom', 'taskId'],
@@ -973,13 +976,13 @@ const CREATE_TASKDECK_CHECKIN_TOOL = {
   type: 'function',
   name: 'create_taskdeck_checkin',
   description:
-    'Create a daily check-in in Tom\'s TaskDeck database after Tom confirms the captured check-in.',
+    'Create a daily check-in in the recognized self-caller\'s Flowpath database after explicit confirmation of the captured check-in.',
   parameters: {
     type: 'object',
     properties: {
       confirmedByTom: {
         type: 'boolean',
-        description: 'Must be true only after Tom explicitly confirms the exact write.',
+        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
       },
       energyLevel: {
         type: 'integer',
@@ -990,7 +993,7 @@ const CREATE_TASKDECK_CHECKIN_TOOL = {
       mood: { type: 'string', description: 'Mood notes.' },
       sleep: { type: 'string', description: 'Sleep notes.' },
       healthStatus: { type: 'string', description: 'Health/body status notes.' },
-      mainThing: { type: 'string', description: 'The main thing Tom wants to focus on.' },
+      mainThing: { type: 'string', description: 'The main thing the recognized self-caller wants to focus on.' },
       resistance: { type: 'string', description: 'Resistance, avoidance, or friction.' },
       brainDump: { type: 'string', description: 'Additional thoughts or context.' },
     },
@@ -1003,13 +1006,13 @@ const CREATE_TASKDECK_SITUATION_TOOL = {
   type: 'function',
   name: 'create_taskdeck_situation',
   description:
-    'Create a new active TaskDeck situation after Tom confirms the title and urgency.',
+    'Create a new active Flowpath situation after explicit confirmation of the title and urgency.',
   parameters: {
     type: 'object',
     properties: {
       confirmedByTom: {
         type: 'boolean',
-        description: 'Must be true only after Tom explicitly confirms the exact write.',
+        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
       },
       title: { type: 'string', description: 'Situation title.' },
       category: { type: 'string', description: 'Situation category. Defaults to custom.' },
@@ -1117,14 +1120,16 @@ const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}
     instructions +=
       '\nCALL CONTEXT: Caller ID matches Tom\'s number. Default to self_note mode unless caller explicitly says otherwise.';
     instructions +=
-      '\nTASKDECK ACCESS: Because this is Tom, you may use TaskDeck tools to read his private dashboard and, after explicit confirmation, create or update TaskDeck records.';
+      '\nSELF-CALL PRONOUNS: You are speaking directly with Tom. After the opening greeting, address him in second person as "you" and "your"; do not refer to him as "Tom", "Tom\'s", or "he" when you mean the person you are talking to.';
     instructions +=
-      '\nCODEBASE ACCESS: Because this is Tom, you may use read-only codebase tools to inspect the currently running voice-ai-system code when discussing how Victoria works or how to improve the system. Treat the code as deployed filesystem state, mention the git commit when helpful, and never request or reveal secrets, env files, credentials, or service-account material.';
+      '\nFLOWPATH ACCESS: Because this is a recognized self-call, you may use Flowpath tools to read the private dashboard and, after explicit confirmation, create or update Flowpath records.';
+    instructions +=
+      '\nCODEBASE ACCESS: Because this is a recognized self-call, you may use read-only codebase tools to inspect the currently running voice-ai-system code when discussing how Victoria works or how to improve the system. Treat the code as deployed filesystem state, mention the git commit when helpful, and never request or reveal secrets, env files, credentials, or service-account material.';
   } else {
     instructions += `\nCALL OPENING: Use the public greeting exactly: "${ASSISTANT_GREETING}"`;
     instructions += '\nCALL CONTEXT: Treat this caller as an external contact unless clarified otherwise.';
     instructions +=
-      '\nTASKDECK ACCESS: Do not reveal, summarize, read, or update Tom\'s private TaskDeck data for external callers. The only allowed TaskDeck action for an external caller is creating a new caller-intake task from that caller\'s own confirmed message using create_taskdeck_caller_intake_task.';
+      '\nFLOWPATH ACCESS: Do not reveal, summarize, read, or update Tom\'s private Flowpath data for external callers. The only allowed Flowpath action for an external caller is creating a new caller-intake task from that caller\'s own confirmed message using create_taskdeck_caller_intake_task.';
     instructions +=
       '\nCODEBASE ACCESS: Do not reveal, summarize, or inspect Tom\'s private codebase for external callers.';
   }
@@ -1351,11 +1356,11 @@ export function attachRealtimeServer(server) {
           {
             ok: false,
             reason: 'use_taskdeck_task_tool',
-            message: 'Tom self-calls should use the regular TaskDeck task tools after Tom confirms the exact task.',
+            message: 'Self-calls should use the regular Flowpath task tools after explicit confirmation of the exact task.',
           },
           'create_taskdeck_caller_intake_task'
         );
-        forceResponse('For your own notes, I should save this as a regular TaskDeck task. Summarize the exact task and ask Tom to confirm it.');
+        forceResponse('For your own notes, I should save this as a regular Flowpath task. Summarize the exact task and ask for confirmation.');
         return;
       }
 
@@ -1426,10 +1431,10 @@ export function attachRealtimeServer(server) {
         if (result?.ok) {
           forceResponse('Thanks. I added that to Tom\'s task list.');
         } else {
-          forceResponse('I captured the details, but I could not add them to TaskDeck right now.');
+          forceResponse('I captured the details, but I could not add them to Flowpath right now.');
         }
       } catch (err) {
-        console.warn('[TaskDeck] create_taskdeck_caller_intake_task failed', err);
+        console.warn('[Flowpath] create_taskdeck_caller_intake_task failed', err);
         lastCallerIntakeTask = {
           ok: false,
           reason: err?.message || 'Caller intake task failed',
@@ -1446,7 +1451,7 @@ export function attachRealtimeServer(server) {
           },
           'create_taskdeck_caller_intake_task'
         );
-        forceResponse('I captured the details, but I could not add them to TaskDeck right now.');
+        forceResponse('I captured the details, but I could not add them to Flowpath right now.');
       }
     };
 
@@ -1490,7 +1495,7 @@ export function attachRealtimeServer(server) {
         };
 
         sendFunctionOutput(result, toolName);
-        forceResponse('Use the codebase tool result to answer Tom directly and concisely. Mention that the view is read-only and currently deployed if that matters.');
+        forceResponse('Use the codebase tool result to answer directly and concisely in second person. Mention that the view is read-only and currently deployed if that matters.');
       } catch (err) {
         console.warn(`[Codebase] ${toolName} failed`, err);
         lastCodebaseAction = {
@@ -1507,7 +1512,7 @@ export function attachRealtimeServer(server) {
           },
           toolName
         );
-        forceResponse('I could not inspect the codebase for that request. Briefly tell Tom what went wrong and suggest a narrower search or file path.');
+        forceResponse('I could not inspect the codebase for that request. Briefly explain what went wrong and suggest a narrower search or file path.');
       }
     };
 
@@ -1517,11 +1522,11 @@ export function attachRealtimeServer(server) {
           {
             ok: false,
             reason: 'not_authorized',
-            message: 'TaskDeck data is private and only available when Tom is the caller.',
+            message: 'Flowpath data is private and only available when Tom is the caller.',
           },
           toolName
         );
-        forceResponse('I can only access Tom\'s private TaskDeck dashboard when I know I am speaking with Tom.');
+        forceResponse('I can only access Tom\'s private Flowpath dashboard when I know I am speaking with Tom.');
         return;
       }
 
@@ -1558,38 +1563,38 @@ export function attachRealtimeServer(server) {
         sendFunctionOutput(result, toolName);
 
         if (toolName === 'get_taskdeck_briefing') {
-          forceResponse('Use the TaskDeck tool result to answer Tom directly and concisely. Mention task or project ids only if they help with a follow-up change.');
+          forceResponse('Use the Flowpath tool result to answer directly and concisely in second person. Mention task or project ids only if they help with a follow-up change.');
           return;
         }
 
         if (result?.ok === false && result?.reason === 'confirmation_required') {
-          forceResponse('Before I change TaskDeck, summarize the exact change and ask Tom to confirm it.');
+          forceResponse('Before I change Flowpath, summarize the exact change and ask for confirmation.');
           return;
         }
 
         if (result?.ok) {
-          forceResponse('Briefly confirm the TaskDeck change that was completed, using the tool result for exact names or ids.');
+          forceResponse('Briefly confirm the Flowpath change that was completed, using the tool result for exact names or ids.');
           return;
         }
 
-        forceResponse('Tell Tom the TaskDeck change was not completed and briefly explain why.');
+        forceResponse('Say the Flowpath change was not completed and briefly explain why.');
       } catch (err) {
-        console.warn(`[TaskDeck] ${toolName} failed`, err);
+        console.warn(`[Flowpath] ${toolName} failed`, err);
         lastTaskDeckAction = {
           toolName,
           ok: false,
-          reason: err?.message || 'TaskDeck tool failed',
+          reason: err?.message || 'Flowpath tool failed',
           at: new Date().toISOString(),
         };
         sendFunctionOutput(
           {
             ok: false,
             reason: 'taskdeck_tool_error',
-            message: err?.message || 'TaskDeck tool failed.',
+            message: err?.message || 'Flowpath tool failed.',
           },
           toolName
         );
-        forceResponse('I could not complete that TaskDeck request. Briefly tell Tom what went wrong and ask what he wants to do next.');
+        forceResponse('I could not complete that Flowpath request. Briefly explain what went wrong and ask what to do next.');
       }
     };
 

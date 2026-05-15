@@ -6,7 +6,8 @@ import { createClient } from '@libsql/client';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DEFAULT_LOCAL_TASKDECK_DB = path.resolve(__dirname, '../../taskdeck/data/taskdeck.db');
+const DEFAULT_LOCAL_FLOWPATH_DB = path.resolve(__dirname, '../../flowpath/data/flowpath.db');
+const LEGACY_LOCAL_TASKDECK_DB = path.resolve(__dirname, '../../taskdeck/data/taskdeck.db');
 const LEGACY_LOCAL_NEEDLE_DB = path.resolve(__dirname, '../../needle.ai/data/needle.db');
 const DEFAULT_TIMEZONE = 'America/New_York';
 const MAX_LIMIT = 25;
@@ -105,11 +106,19 @@ const booleanValue = (value, fallback = false) => {
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
 
 export function getTaskDeckDatabaseUrl() {
-  const configured = process.env.TASKDECK_DATABASE_URL || process.env.NEEDLE_DATABASE_URL || process.env.DATABASE_URL;
+  const configured =
+    process.env.FLOWPATH_DATABASE_URL ||
+    process.env.TASKDECK_DATABASE_URL ||
+    process.env.NEEDLE_DATABASE_URL ||
+    process.env.DATABASE_URL;
   if (configured) return configured;
 
-  if (existsSync(DEFAULT_LOCAL_TASKDECK_DB)) {
-    return `file:${DEFAULT_LOCAL_TASKDECK_DB}`;
+  if (existsSync(DEFAULT_LOCAL_FLOWPATH_DB)) {
+    return `file:${DEFAULT_LOCAL_FLOWPATH_DB}`;
+  }
+
+  if (existsSync(LEGACY_LOCAL_TASKDECK_DB)) {
+    return `file:${LEGACY_LOCAL_TASKDECK_DB}`;
   }
 
   if (existsSync(LEGACY_LOCAL_NEEDLE_DB)) {
@@ -121,6 +130,8 @@ export function getTaskDeckDatabaseUrl() {
 
 function getTaskDeckAuthToken() {
   return (
+    process.env.FLOWPATH_DATABASE_AUTH_TOKEN ||
+    process.env.FLOWPATH_TURSO_AUTH_TOKEN ||
     process.env.TASKDECK_DATABASE_AUTH_TOKEN ||
     process.env.TASKDECK_TURSO_AUTH_TOKEN ||
     process.env.NEEDLE_DATABASE_AUTH_TOKEN ||
@@ -134,7 +145,7 @@ function getTaskDeckAuthToken() {
 function getClient() {
   const databaseUrl = getTaskDeckDatabaseUrl();
   if (!databaseUrl) {
-    throw new Error('TASKDECK_DATABASE_URL is not configured and the local TaskDeck database was not found.');
+    throw new Error('FLOWPATH_DATABASE_URL is not configured and the local Flowpath database was not found.');
   }
 
   if (!client) {
@@ -183,7 +194,7 @@ async function resolveLifeAreaId({ lifeAreaId, lifeAreaName } = {}) {
   if (lifeAreaId != null && lifeAreaId !== '') {
     const id = positiveInteger(lifeAreaId, 'lifeAreaId');
     const lifeArea = await first('SELECT id FROM life_areas WHERE id = ?', [id]);
-    if (!lifeArea) throw new Error(`No TaskDeck life area exists with id ${id}.`);
+    if (!lifeArea) throw new Error(`No Flowpath life area exists with id ${id}.`);
     return id;
   }
 
@@ -194,7 +205,7 @@ async function resolveLifeAreaId({ lifeAreaId, lifeAreaName } = {}) {
     'SELECT id FROM life_areas WHERE name = ? COLLATE NOCASE LIMIT 1',
     [name]
   );
-  if (!lifeArea) throw new Error(`No TaskDeck life area exists named "${name}".`);
+  if (!lifeArea) throw new Error(`No Flowpath life area exists named "${name}".`);
   return lifeArea.id;
 }
 
@@ -202,7 +213,7 @@ async function resolveProject({ projectId, projectName } = {}) {
   if (projectId != null && projectId !== '') {
     const id = positiveInteger(projectId, 'projectId');
     const project = await first('SELECT id, life_area_id FROM projects WHERE id = ?', [id]);
-    if (!project) throw new Error(`No TaskDeck project exists with id ${id}.`);
+    if (!project) throw new Error(`No Flowpath project exists with id ${id}.`);
     return project;
   }
 
@@ -213,7 +224,7 @@ async function resolveProject({ projectId, projectName } = {}) {
     'SELECT id, life_area_id FROM projects WHERE name = ? COLLATE NOCASE LIMIT 1',
     [name]
   );
-  if (!project) throw new Error(`No TaskDeck project exists named "${name}".`);
+  if (!project) throw new Error(`No Flowpath project exists named "${name}".`);
   return project;
 }
 
@@ -486,7 +497,7 @@ export async function updateTaskDeckTask(input = {}) {
 
   const taskId = positiveInteger(input.taskId, 'taskId');
   const existing = await getTask(taskId);
-  if (!existing) throw new Error(`No TaskDeck task exists with id ${taskId}.`);
+  if (!existing) throw new Error(`No Flowpath task exists with id ${taskId}.`);
 
   const updates = [];
   const args = [];
@@ -617,7 +628,7 @@ export async function createTaskDeckSituation(input = {}) {
     VALUES (?, 'assistant', ?, ?)`,
     [
       sessionId,
-      'What do you most want to change about this situation, and what would feel meaningfully different if TaskDeck helped you make progress?',
+      'What do you most want to change about this situation, and what would feel meaningfully different if Flowpath helped you make progress?',
       now,
     ]
   );
