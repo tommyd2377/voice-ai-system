@@ -91,6 +91,7 @@ flowchart LR
 - Twilio stream lifecycle (`start`, `media`, `mark`, `stop`, close/error)
 - OpenAI lifecycle (`session.*`, `response.*`, function call deltas)
 - Function-call assembly for Flowpath caller-intake and private self-call tools
+- App-controlled barge-in debounce before clearing/cancelling assistant audio
 - Usage accounting (`input/output/audio/cached token` aggregates)
 
 ## Tool Contract: `create_taskdeck_caller_intake_task`
@@ -116,10 +117,17 @@ Behavior notes:
 Victoria can use these tools only for self-calls, determined by caller ID matching `TWILIO_OWNER_PHONE`:
 
 - `get_taskdeck_briefing`: read profile/memory, life areas, active projects, tasks, situations, recent check-ins, daily plans, and Next Move plans.
-- `create_taskdeck_task`: create a task after Tom confirms the exact task.
-- `update_taskdeck_task`: update a known task after Tom confirms the exact change.
+- `get_taskdeck_record`: read one exact Flowpath record by id.
+- `create_taskdeck_task`: create a task after Tom confirms the exact task, including optional situation and Next Move plan attachment.
+- `update_taskdeck_task`: update a known task after Tom confirms the exact change, including status, friction, estimate, situation, and plan attachment fields.
 - `create_taskdeck_checkin`: create a daily check-in after Tom confirms the captured check-in.
 - `create_taskdeck_situation`: create a new active situation and initial intake session after Tom confirms it.
+- `update_taskdeck_situation`: update an existing situation after Tom confirms the exact change.
+- `create_taskdeck_project` / `update_taskdeck_project`: create or update projects after confirmation.
+- `create_taskdeck_life_area` / `update_taskdeck_life_area`: create or update life areas after confirmation.
+- `create_taskdeck_daily_plan`: create a manually confirmed daily plan without triggering Flowpath plan generation.
+- `create_taskdeck_tasks_from_next_move_plan`: convert an existing Next Move plan's task candidates into attached tasks.
+- `search_web`: owner-only web search via the OpenAI Responses API `web_search` tool. Search results are conversational context only until Tom separately confirms any Flowpath write.
 
 External callers get only `create_taskdeck_caller_intake_task`, which inserts a standalone task from their confirmed message and returns only a minimal result.
 
@@ -160,6 +168,8 @@ Legacy `TASKDECK_*` and `NEEDLE_*` database environment variables and local data
 
 ### Optional
 - `OPENAI_REALTIME_ENDPOINT` (runtime forces model query param to `gpt-realtime-2`)
+- `OPENAI_WEB_SEARCH_MODEL` (default `gpt-5.5`)
+- `OPENAI_WEB_SEARCH_CONTEXT_SIZE` (`low`, `medium`, or `high`; default `medium`)
 - `PHONE_RELAY_NUMBER`
 - `PORT` (default `8080`)
 - `VERBOSE_OPENAI_LOGS=true` for deeper event logs

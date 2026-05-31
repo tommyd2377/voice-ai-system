@@ -5,17 +5,27 @@ import {
   searchCodebase,
 } from './codebaseData.js';
 import {
+  createTaskDeckDailyPlan,
   createTaskDeckCallerIntakeTask,
   createTaskDeckCheckIn,
+  createTaskDeckLifeArea,
+  createTaskDeckProject,
   createTaskDeckSituation,
   createTaskDeckTask,
+  createTaskDeckTasksFromNextMovePlan,
+  getTaskDeckRecord,
   getTaskDeckBriefing,
+  updateTaskDeckLifeArea,
+  updateTaskDeckProject,
+  updateTaskDeckSituation,
   updateTaskDeckTask,
 } from './taskdeckData.js';
 
 const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
 const ASSISTANT_GREETING = "Hey, I'm Victoria, Tom's AI assistant. How can I help you today?";
 const SELF_CALLER_GREETING = "Hey Tom, what's up?";
+const BARGE_IN_GRACE_MS = 500;
+const WEB_SEARCH_CONTEXT_SIZES = new Set(['low', 'medium', 'high']);
 
 const BASE_INSTRUCTIONS = `
 You are Victoria, the personal AI assistant and operator for Thomas DeVito.
@@ -696,6 +706,157 @@ const DEFAULT_REALTIME_ENDPOINT = (() => {
   }
 })();
 const DEFAULT_MODEL = 'gpt-realtime-2';
+const DEFAULT_WEB_SEARCH_MODEL = 'gpt-5.5';
+const DEFAULT_WEB_SEARCH_CONTEXT_SIZE = 'medium';
+
+const getWebSearchContextSize = () => {
+  const configured = process.env.OPENAI_WEB_SEARCH_CONTEXT_SIZE?.trim().toLowerCase();
+  return WEB_SEARCH_CONTEXT_SIZES.has(configured) ? configured : DEFAULT_WEB_SEARCH_CONTEXT_SIZE;
+};
+
+const getWebSearchModel = () => process.env.OPENAI_WEB_SEARCH_MODEL?.trim() || DEFAULT_WEB_SEARCH_MODEL;
+
+const extractResponseText = (response) => {
+  if (typeof response?.output_text === 'string' && response.output_text.trim()) {
+    return response.output_text.trim();
+  }
+
+  const output = Array.isArray(response?.output) ? response.output : [];
+  const textParts = [];
+  for (const item of output) {
+    const content = Array.isArray(item?.content) ? item.content : [];
+    for (const part of content) {
+      if (typeof part?.text === 'string' && part.text.trim()) {
+        textParts.push(part.text.trim());
+      }
+    }
+  }
+
+  return textParts.join('\n\n').trim();
+};
+
+const extractResponseSources = (response) => {
+  const sourcesByUrl = new Map();
+  const addSource = (source) => {
+    const url = source?.url || source?.uri;
+    if (!url || sourcesByUrl.has(url)) return;
+    sourcesByUrl.set(url, {
+      title: source?.title || url,
+      url,
+    });
+  };
+
+  const output = Array.isArray(response?.output) ? response.output : [];
+  for (const item of output) {
+    const actionSources = Array.isArray(item?.action?.sources) ? item.action.sources : [];
+    actionSources.forEach(addSource);
+
+    const content = Array.isArray(item?.content) ? item.content : [];
+    for (const part of content) {
+      const annotations = Array.isArray(part?.annotations) ? part.annotations : [];
+      for (const annotation of annotations) {
+        if (annotation?.type === 'url_citation') {
+          addSource(annotation);
+        }
+      }
+    }
+  }
+
+  return Array.from(sourcesByUrl.values()).slice(0, 6);
+};
+
+export async function searchWeb(input = {}, options = {}) {
+  const query = sanitizeText(input.query, 500);
+  if (!query) throw new Error('query is required.');
+
+  const apiKey = options.apiKey || process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('Missing OPENAI_API_KEY.');
+
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  if (typeof fetchImpl !== 'function') throw new Error('No fetch implementation is available.');
+
+  const contextSize = WEB_SEARCH_CONTEXT_SIZES.has(input.searchContextSize)
+    ? input.searchContextSize
+    : getWebSearchContextSize();
+  const response = await fetchImpl('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: getWebSearchModel(),
+      input: query,
+      tools: [
+        {
+          type: 'web_search',
+          search_context_size: contextSize,
+        },
+      ],
+      include: ['web_search_call.action.sources'],
+      tool_choice: 'auto',
+    }),
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = payload?.error?.message || `OpenAI web search failed with status ${response.status}.`;
+    throw new Error(message);
+  }
+
+  return {
+    ok: true,
+    query,
+    summary: extractResponseText(payload),
+    sources: extractResponseSources(payload),
+    searchedAt: new Date().toISOString(),
+  };
+}
+
+export function createBargeInController({
+  graceMs = BARGE_IN_GRACE_MS,
+  onBargeIn,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
+} = {}) {
+  let userSpeaking = false;
+  let pendingTimer = null;
+  let bargeInTriggered = false;
+
+  const clearPendingTimer = () => {
+    if (pendingTimer) {
+      clearTimeoutFn(pendingTimer);
+      pendingTimer = null;
+    }
+  };
+
+  const reset = () => {
+    userSpeaking = false;
+    bargeInTriggered = false;
+    clearPendingTimer();
+  };
+
+  return {
+    isUserSpeaking: () => userSpeaking,
+    handleSpeechStarted: () => {
+      userSpeaking = true;
+      bargeInTriggered = false;
+      clearPendingTimer();
+      pendingTimer = setTimeoutFn(() => {
+        pendingTimer = null;
+        if (!userSpeaking || bargeInTriggered) return;
+        bargeInTriggered = true;
+        onBargeIn?.();
+      }, graceMs);
+    },
+    handleSpeechStopped: () => {
+      userSpeaking = false;
+      clearPendingTimer();
+    },
+    handleResponseCreated: reset,
+    reset,
+  };
+}
 
 const CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL = {
   type: 'function',
@@ -847,6 +1008,26 @@ const GET_TASKDECK_BRIEFING_TOOL = {
   },
 };
 
+const GET_TASKDECK_RECORD_TOOL = {
+  type: 'function',
+  name: 'get_taskdeck_record',
+  description:
+    'Read one exact Flowpath record by id for the recognized self-caller. Supports tasks, projects, life areas, situations, check-ins, daily plans, and Next Move plans.',
+  parameters: {
+    type: 'object',
+    properties: {
+      recordType: {
+        type: 'string',
+        enum: ['task', 'project', 'life_area', 'situation', 'checkin', 'daily_plan', 'next_move_plan'],
+        description: 'Type of Flowpath record to read.',
+      },
+      id: { type: 'integer', minimum: 1, description: 'Flowpath record id.' },
+    },
+    required: ['recordType', 'id'],
+    additionalProperties: false,
+  },
+};
+
 const CREATE_TASKDECK_TASK_TOOL = {
   type: 'function',
   name: 'create_taskdeck_task',
@@ -863,7 +1044,7 @@ const CREATE_TASKDECK_TASK_TOOL = {
       notes: { type: 'string', description: 'Optional task notes.' },
       status: {
         type: 'string',
-        enum: ['open', 'done', 'ignored'],
+        enum: ['open', 'in_progress', 'blocked', 'done', 'ignored'],
         description: 'Task status. Usually open.',
       },
       importance: {
@@ -882,6 +1063,13 @@ const CREATE_TASKDECK_TASK_TOOL = {
         type: 'string',
         nullable: true,
         description: 'Optional due date in YYYY-MM-DD format.',
+      },
+      estimatedMinutes: {
+        type: 'integer',
+        nullable: true,
+        minimum: 1,
+        maximum: 480,
+        description: 'Optional estimated minutes.',
       },
       projectId: {
         type: 'integer',
@@ -903,6 +1091,27 @@ const CREATE_TASKDECK_TASK_TOOL = {
         nullable: true,
         description: 'Optional existing Flowpath life area name to attach the task to.',
       },
+      situationId: {
+        type: 'integer',
+        nullable: true,
+        description: 'Optional existing Flowpath situation id to attach the task to.',
+      },
+      nextMovePlanId: {
+        type: 'integer',
+        nullable: true,
+        description: 'Optional existing Flowpath Next Move plan id this task comes from.',
+      },
+      sourcePlanSection: {
+        type: 'string',
+        nullable: true,
+        description: 'Optional source section from a plan, such as task_candidate or first_30_minutes.',
+      },
+      frictionType: {
+        type: 'string',
+        enum: ['none', 'unclear', 'too_large', 'scary', 'blocked', 'low_energy', 'needs_person', 'not_important', 'admin_drag'],
+        description: 'Optional friction category.',
+      },
+      frictionNote: { type: 'string', description: 'Optional friction note.' },
     },
     required: ['confirmedByTom', 'title'],
     additionalProperties: false,
@@ -925,7 +1134,7 @@ const UPDATE_TASKDECK_TASK_TOOL = {
       title: { type: 'string', description: 'Optional replacement task title.' },
       status: {
         type: 'string',
-        enum: ['open', 'done', 'ignored'],
+        enum: ['open', 'in_progress', 'blocked', 'done', 'ignored'],
         description: 'Optional replacement task status.',
       },
       importance: {
@@ -946,6 +1155,19 @@ const UPDATE_TASKDECK_TASK_TOOL = {
         description: 'Optional replacement due date in YYYY-MM-DD format, or null to clear.',
       },
       notes: { type: 'string', description: 'Optional replacement notes.' },
+      estimatedMinutes: {
+        type: 'integer',
+        nullable: true,
+        minimum: 1,
+        maximum: 480,
+        description: 'Optional estimated minutes, or null to clear.',
+      },
+      frictionType: {
+        type: 'string',
+        enum: ['none', 'unclear', 'too_large', 'scary', 'blocked', 'low_energy', 'needs_person', 'not_important', 'admin_drag'],
+        description: 'Optional friction category.',
+      },
+      frictionNote: { type: 'string', description: 'Optional friction note.' },
       projectId: {
         type: 'integer',
         nullable: true,
@@ -965,6 +1187,21 @@ const UPDATE_TASKDECK_TASK_TOOL = {
         type: 'string',
         nullable: true,
         description: 'Optional existing Flowpath life area name.',
+      },
+      situationId: {
+        type: 'integer',
+        nullable: true,
+        description: 'Optional existing Flowpath situation id, or null to clear.',
+      },
+      nextMovePlanId: {
+        type: 'integer',
+        nullable: true,
+        description: 'Optional existing Flowpath Next Move plan id, or null to clear.',
+      },
+      sourcePlanSection: {
+        type: 'string',
+        nullable: true,
+        description: 'Optional source section from a plan, or null to clear.',
       },
     },
     required: ['confirmedByTom', 'taskId'],
@@ -1031,12 +1268,193 @@ const CREATE_TASKDECK_SITUATION_TOOL = {
   },
 };
 
+const UPDATE_TASKDECK_SITUATION_TOOL = {
+  type: 'function',
+  name: 'update_taskdeck_situation',
+  description:
+    'Update an existing Flowpath situation after explicit confirmation. Non-destructive; no deletion.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: {
+        type: 'boolean',
+        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
+      },
+      situationId: { type: 'integer', minimum: 1, description: 'Existing Flowpath situation id.' },
+      title: { type: 'string', description: 'Optional replacement title.' },
+      description: { type: 'string', description: 'Optional replacement description.' },
+      category: { type: 'string', description: 'Optional replacement category.' },
+      urgency: { type: 'string', enum: ['low', 'medium', 'high', 'crisis'], description: 'Optional urgency.' },
+      status: { type: 'string', enum: ['active', 'resolved', 'archived'], description: 'Optional status.' },
+    },
+    required: ['confirmedByTom', 'situationId'],
+    additionalProperties: false,
+  },
+};
+
+const CREATE_TASKDECK_PROJECT_TOOL = {
+  type: 'function',
+  name: 'create_taskdeck_project',
+  description: 'Create a Flowpath project for the recognized self-caller after explicit confirmation.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
+      name: { type: 'string', description: 'Project name.' },
+      lifeAreaId: { type: 'integer', nullable: true, description: 'Optional existing life area id.' },
+      lifeAreaName: { type: 'string', nullable: true, description: 'Optional existing life area name.' },
+      status: { type: 'string', enum: ['active', 'paused', 'someday', 'done'], description: 'Project status.' },
+      description: { type: 'string', description: 'Project description.' },
+      nextMilestone: { type: 'string', description: 'Next milestone.' },
+      currentBottleneck: { type: 'string', description: 'Current bottleneck.' },
+      whyItMatters: { type: 'string', description: 'Why the project matters.' },
+    },
+    required: ['confirmedByTom', 'name'],
+    additionalProperties: false,
+  },
+};
+
+const UPDATE_TASKDECK_PROJECT_TOOL = {
+  type: 'function',
+  name: 'update_taskdeck_project',
+  description: 'Update a Flowpath project for the recognized self-caller after explicit confirmation.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
+      projectId: { type: 'integer', minimum: 1, description: 'Existing project id.' },
+      name: { type: 'string', description: 'Optional replacement project name.' },
+      lifeAreaId: { type: 'integer', nullable: true, description: 'Optional existing life area id, or null to clear.' },
+      lifeAreaName: { type: 'string', nullable: true, description: 'Optional existing life area name.' },
+      status: { type: 'string', enum: ['active', 'paused', 'someday', 'done'], description: 'Optional project status.' },
+      description: { type: 'string', description: 'Optional description.' },
+      nextMilestone: { type: 'string', description: 'Optional next milestone.' },
+      currentBottleneck: { type: 'string', description: 'Optional current bottleneck.' },
+      whyItMatters: { type: 'string', description: 'Optional why-it-matters note.' },
+    },
+    required: ['confirmedByTom', 'projectId'],
+    additionalProperties: false,
+  },
+};
+
+const CREATE_TASKDECK_LIFE_AREA_TOOL = {
+  type: 'function',
+  name: 'create_taskdeck_life_area',
+  description: 'Create a Flowpath life area for the recognized self-caller after explicit confirmation.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
+      name: { type: 'string', description: 'Life area name.' },
+      description: { type: 'string', description: 'Life area description.' },
+      priorityLevel: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Priority level.' },
+      desiredOutcome: { type: 'string', description: 'Desired outcome.' },
+      currentBottleneck: { type: 'string', description: 'Current bottleneck.' },
+    },
+    required: ['confirmedByTom', 'name'],
+    additionalProperties: false,
+  },
+};
+
+const UPDATE_TASKDECK_LIFE_AREA_TOOL = {
+  type: 'function',
+  name: 'update_taskdeck_life_area',
+  description: 'Update a Flowpath life area for the recognized self-caller after explicit confirmation.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
+      lifeAreaId: { type: 'integer', minimum: 1, description: 'Existing life area id.' },
+      name: { type: 'string', description: 'Optional replacement name.' },
+      description: { type: 'string', description: 'Optional description.' },
+      priorityLevel: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Optional priority level.' },
+      desiredOutcome: { type: 'string', description: 'Optional desired outcome.' },
+      currentBottleneck: { type: 'string', description: 'Optional current bottleneck.' },
+    },
+    required: ['confirmedByTom', 'lifeAreaId'],
+    additionalProperties: false,
+  },
+};
+
+const CREATE_TASKDECK_DAILY_PLAN_TOOL = {
+  type: 'function',
+  name: 'create_taskdeck_daily_plan',
+  description:
+    'Create a manually confirmed Flowpath daily plan. This does not trigger Flowpath plan generation.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
+      planDate: { type: 'string', nullable: true, description: 'Optional YYYY-MM-DD plan date. Defaults to today.' },
+      checkInId: { type: 'integer', nullable: true, description: 'Optional existing check-in id.' },
+      todayTheme: { type: 'string', description: 'Theme for today.' },
+      honestRead: { type: 'string', description: 'Honest read of today.' },
+      top3Actions: {
+        type: 'array',
+        maxItems: 3,
+        items: { type: 'object', additionalProperties: true },
+        description: 'Up to three action objects.',
+      },
+      avoidToday: { type: 'string', description: 'What to avoid today.' },
+      optionalIfEnergyIsHigh: { type: 'string', description: 'Optional high-energy action.' },
+      minimumViableDay: { type: 'string', description: 'Minimum viable day.' },
+      eveningReviewPrompt: { type: 'string', description: 'Evening review prompt.' },
+    },
+    required: ['confirmedByTom', 'todayTheme'],
+    additionalProperties: false,
+  },
+};
+
+const CREATE_TASKDECK_TASKS_FROM_NEXT_MOVE_PLAN_TOOL = {
+  type: 'function',
+  name: 'create_taskdeck_tasks_from_next_move_plan',
+  description:
+    'Convert an existing Flowpath Next Move plan into attached tasks after explicit confirmation. Does not generate a new plan.',
+  parameters: {
+    type: 'object',
+    properties: {
+      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
+      nextMovePlanId: { type: 'integer', minimum: 1, description: 'Existing Next Move plan id.' },
+    },
+    required: ['confirmedByTom', 'nextMovePlanId'],
+    additionalProperties: false,
+  },
+};
+
+const SEARCH_WEB_TOOL = {
+  type: 'function',
+  name: 'search_web',
+  description:
+    'Search the public web for the recognized self-caller. Use for current, local, volatile, or source-backed information. Never write Flowpath records from results without separate explicit confirmation.',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Public web search query.' },
+      searchContextSize: {
+        type: 'string',
+        enum: ['low', 'medium', 'high'],
+        description: 'Optional amount of search context. Defaults to configured medium.',
+      },
+    },
+    required: ['query'],
+    additionalProperties: false,
+  },
+};
+
 const TASKDECK_TOOLS = [
   GET_TASKDECK_BRIEFING_TOOL,
+  GET_TASKDECK_RECORD_TOOL,
   CREATE_TASKDECK_TASK_TOOL,
   UPDATE_TASKDECK_TASK_TOOL,
   CREATE_TASKDECK_CHECKIN_TOOL,
   CREATE_TASKDECK_SITUATION_TOOL,
+  UPDATE_TASKDECK_SITUATION_TOOL,
+  CREATE_TASKDECK_PROJECT_TOOL,
+  UPDATE_TASKDECK_PROJECT_TOOL,
+  CREATE_TASKDECK_LIFE_AREA_TOOL,
+  UPDATE_TASKDECK_LIFE_AREA_TOOL,
+  CREATE_TASKDECK_DAILY_PLAN_TOOL,
+  CREATE_TASKDECK_TASKS_FROM_NEXT_MOVE_PLAN_TOOL,
 ];
 
 const CODEBASE_TOOLS = [
@@ -1045,7 +1463,11 @@ const CODEBASE_TOOLS = [
   READ_CODE_SNIPPET_TOOL,
 ];
 
-const REALTIME_TOOLS = [CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL, ...TASKDECK_TOOLS, ...CODEBASE_TOOLS];
+const EXTERNAL_CALLER_TOOLS = [CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL];
+const OWNER_REALTIME_TOOLS = [CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL, ...TASKDECK_TOOLS, ...CODEBASE_TOOLS, SEARCH_WEB_TOOL];
+
+export const getRealtimeToolsForCaller = (isSelfCaller = false) =>
+  isSelfCaller ? OWNER_REALTIME_TOOLS : EXTERNAL_CALLER_TOOLS;
 
 const INVALID_PHONE_VALUES = new Set([
   '',
@@ -1122,7 +1544,9 @@ const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}
     instructions +=
       '\nSELF-CALL PRONOUNS: You are speaking directly with Tom. After the opening greeting, address him in second person as "you" and "your"; do not refer to him as "Tom", "Tom\'s", or "he" when you mean the person you are talking to.';
     instructions +=
-      '\nFLOWPATH ACCESS: Because this is a recognized self-call, you may use Flowpath tools to read the private dashboard and, after explicit confirmation, create or update Flowpath records.';
+      '\nFLOWPATH ACCESS: Because this is a recognized self-call, you may use Flowpath tools to read the private dashboard and, after explicit confirmation, create or update non-destructive Flowpath records including tasks, projects, life areas, situations, check-ins, daily plans, and converting existing Next Move plans into tasks. You must separately confirm the exact Flowpath write before every write tool call.';
+    instructions +=
+      '\nWEB SEARCH ACCESS: Because this is a recognized self-call, you may use search_web for public, current, local, volatile, or source-backed information. Discuss results conversationally, cite source names when useful, and do not save anything to Flowpath from search results until Tom confirms the exact Flowpath change.';
     instructions +=
       '\nCODEBASE ACCESS: Because this is a recognized self-call, you may use read-only codebase tools to inspect the currently running voice-ai-system code when discussing how Victoria works or how to improve the system. Treat the code as deployed filesystem state, mention the git commit when helpful, and never request or reveal secrets, env files, credentials, or service-account material.';
   } else {
@@ -1130,6 +1554,8 @@ const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}
     instructions += '\nCALL CONTEXT: Treat this caller as an external contact unless clarified otherwise.';
     instructions +=
       '\nFLOWPATH ACCESS: Do not reveal, summarize, read, or update Tom\'s private Flowpath data for external callers. The only allowed Flowpath action for an external caller is creating a new caller-intake task from that caller\'s own confirmed message using create_taskdeck_caller_intake_task.';
+    instructions +=
+      '\nWEB SEARCH ACCESS: Do not use web search for external callers.';
     instructions +=
       '\nCODEBASE ACCESS: Do not reveal, summarize, or inspect Tom\'s private codebase for external callers.';
   }
@@ -1175,6 +1601,7 @@ export function attachRealtimeServer(server) {
     let lastCallerIntakeTask = null;
     let lastTaskDeckAction = null;
     let lastCodebaseAction = null;
+    let lastWebSearchAction = null;
     let callStartMs = Date.now();
     let callEndMs = null;
     let openaiReady = false;
@@ -1250,17 +1677,32 @@ export function attachRealtimeServer(server) {
       }
     };
 
+    const bargeInController = createBargeInController({
+      onBargeIn: () => {
+        userSpeaking = true;
+        sendClearToTwilio();
+        cancelActiveResponse();
+      },
+    });
+
     const handleSpeechStarted = () => {
       if (VERBOSE_OPENAI_LOGS) {
         console.log('[OpenAI] event=input_audio_buffer.speech_started');
       }
       userSpeaking = true;
-      sendClearToTwilio();
-      cancelActiveResponse();
+      bargeInController.handleSpeechStarted();
+    };
+
+    const handleSpeechStopped = () => {
+      if (VERBOSE_OPENAI_LOGS) {
+        console.log('[OpenAI] event=input_audio_buffer.speech_stopped');
+      }
+      userSpeaking = false;
+      bargeInController.handleSpeechStopped();
     };
 
     const forwardAudioToTwilio = (audioChunk) => {
-      if (!streamSid || userSpeaking || !activeResponse) {
+      if (!streamSid || userSpeaking || bargeInController.isUserSpeaking() || !activeResponse) {
         return;
       }
 
@@ -1305,7 +1747,7 @@ export function attachRealtimeServer(server) {
             type: 'realtime',
             model: DEFAULT_MODEL,
             instructions,
-            tools: REALTIME_TOOLS,
+            tools: getRealtimeToolsForCaller(isSelfCaller),
           },
         })
       );
@@ -1537,6 +1979,9 @@ export function attachRealtimeServer(server) {
           case 'get_taskdeck_briefing':
             result = await getTaskDeckBriefing(parsedArgs);
             break;
+          case 'get_taskdeck_record':
+            result = await getTaskDeckRecord(parsedArgs);
+            break;
           case 'create_taskdeck_task':
             result = await createTaskDeckTask(parsedArgs);
             break;
@@ -1548,6 +1993,27 @@ export function attachRealtimeServer(server) {
             break;
           case 'create_taskdeck_situation':
             result = await createTaskDeckSituation(parsedArgs);
+            break;
+          case 'update_taskdeck_situation':
+            result = await updateTaskDeckSituation(parsedArgs);
+            break;
+          case 'create_taskdeck_project':
+            result = await createTaskDeckProject(parsedArgs);
+            break;
+          case 'update_taskdeck_project':
+            result = await updateTaskDeckProject(parsedArgs);
+            break;
+          case 'create_taskdeck_life_area':
+            result = await createTaskDeckLifeArea(parsedArgs);
+            break;
+          case 'update_taskdeck_life_area':
+            result = await updateTaskDeckLifeArea(parsedArgs);
+            break;
+          case 'create_taskdeck_daily_plan':
+            result = await createTaskDeckDailyPlan(parsedArgs);
+            break;
+          case 'create_taskdeck_tasks_from_next_move_plan':
+            result = await createTaskDeckTasksFromNextMovePlan(parsedArgs);
             break;
           default:
             result = { ok: false, reason: 'unsupported_taskdeck_tool' };
@@ -1562,7 +2028,7 @@ export function attachRealtimeServer(server) {
 
         sendFunctionOutput(result, toolName);
 
-        if (toolName === 'get_taskdeck_briefing') {
+        if (toolName === 'get_taskdeck_briefing' || toolName === 'get_taskdeck_record') {
           forceResponse('Use the Flowpath tool result to answer directly and concisely in second person. Mention task or project ids only if they help with a follow-up change.');
           return;
         }
@@ -1598,6 +2064,50 @@ export function attachRealtimeServer(server) {
       }
     };
 
+    const handleWebSearchTool = async (parsedArgs) => {
+      if (!isSelfCaller) {
+        sendFunctionOutput(
+          {
+            ok: false,
+            reason: 'not_authorized',
+            message: 'Web search is only available when Tom is the caller.',
+          },
+          'search_web'
+        );
+        forceResponse('I can only use web search when I know I am speaking with Tom.');
+        return;
+      }
+
+      try {
+        const result = await searchWeb(parsedArgs);
+        lastWebSearchAction = {
+          ok: Boolean(result?.ok),
+          query: result?.query || null,
+          sourceCount: Array.isArray(result?.sources) ? result.sources.length : 0,
+          at: result?.searchedAt || new Date().toISOString(),
+        };
+        sendFunctionOutput(result, 'search_web');
+        forceResponse('Use the web search result to answer directly. Mention source names when useful. Do not create or update Flowpath from these results unless Tom separately confirms the exact change.');
+      } catch (err) {
+        console.warn('[WebSearch] search_web failed', err);
+        lastWebSearchAction = {
+          ok: false,
+          query: sanitizeText(parsedArgs?.query, 500),
+          reason: err?.message || 'Web search failed',
+          at: new Date().toISOString(),
+        };
+        sendFunctionOutput(
+          {
+            ok: false,
+            reason: 'web_search_error',
+            message: err?.message || 'Web search failed.',
+          },
+          'search_web'
+        );
+        forceResponse('I could not complete that web search. Briefly explain what went wrong and ask what to do next.');
+      }
+    };
+
     const handleFunctionCallDone = async () => {
       if (!functionCallName || !functionCallBuffer) {
         resetFunctionCallState();
@@ -1621,6 +2131,12 @@ export function attachRealtimeServer(server) {
 
         if (CODEBASE_TOOLS.some((tool) => tool.name === functionCallName)) {
           await handleCodebaseTool(functionCallName, parsedArgs);
+          resetFunctionCallState();
+          return;
+        }
+
+        if (functionCallName === 'search_web') {
+          await handleWebSearchTool(parsedArgs);
           resetFunctionCallState();
           return;
         }
@@ -1723,6 +2239,9 @@ export function attachRealtimeServer(server) {
           case 'input_audio_buffer.speech_started':
             handleSpeechStarted();
             return;
+          case 'input_audio_buffer.speech_stopped':
+            handleSpeechStopped();
+            return;
           case 'conversation.item.input_audio_transcription.completed': {
             const transcript =
               message.transcript ||
@@ -1739,6 +2258,7 @@ export function attachRealtimeServer(server) {
             currentResponseId = message.response?.id || currentResponseId;
             activeResponse = true;
             userSpeaking = false;
+            bargeInController.handleResponseCreated();
             if (VERBOSE_OPENAI_LOGS) {
               console.log('[OpenAI] event=response.created id=', currentResponseId);
             }
@@ -1768,6 +2288,8 @@ export function attachRealtimeServer(server) {
           case 'response.done':
           case 'response.cancelled':
             activeResponse = false;
+            userSpeaking = false;
+            bargeInController.reset();
             if (VERBOSE_OPENAI_LOGS) {
               console.log('[OpenAI] event=response.end type=', type);
             }
@@ -1812,6 +2334,7 @@ export function attachRealtimeServer(server) {
 
     socket.on('close', (code, reason) => {
       callEndMs = Date.now();
+      bargeInController.reset();
       const callDurationSeconds = Math.round((callEndMs - callStartMs) / 1000);
       const reasonText = normalizeReason(reason);
       const callerPhone = normalizeCallerPhone(inferredCallerPhone);
@@ -1828,6 +2351,7 @@ export function attachRealtimeServer(server) {
         callerIntakeTask: lastCallerIntakeTask,
         lastTaskDeckAction,
         lastCodebaseAction,
+        lastWebSearchAction,
         callDurationSeconds,
         openaiUsageTotals,
       });
@@ -1883,11 +2407,11 @@ export function connectToOpenAI() {
             },
             turn_detection: {
               type: 'server_vad',
-              threshold: 0.45,
-              prefix_padding_ms: 200,
-              silence_duration_ms: 550,
+              threshold: 0.65,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 650,
               create_response: true,
-              interrupt_response: true,
+              interrupt_response: false,
             },
           },
           output: {
@@ -1895,7 +2419,7 @@ export function connectToOpenAI() {
             voice: 'marin',
           },
         },
-        tools: REALTIME_TOOLS,
+        tools: EXTERNAL_CALLER_TOOLS,
       },
     };
 
