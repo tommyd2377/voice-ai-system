@@ -127,7 +127,7 @@ Victoria can use these tools only for self-calls, determined by caller ID matchi
 - `create_taskdeck_life_area` / `update_taskdeck_life_area`: create or update life areas after confirmation.
 - `create_taskdeck_daily_plan`: create a manually confirmed daily plan without triggering Flowpath plan generation.
 - `create_taskdeck_tasks_from_next_move_plan`: convert an existing Next Move plan's task candidates into attached tasks.
-- `search_web`: owner-only web search via the OpenAI Responses API `web_search` tool. Search results are conversational context only until Tom separately confirms any Flowpath write.
+- `search_web`: owner-only quick web lookup via the OpenAI Responses API `web_search` tool. Search results are conversational context only until Tom separately confirms any Flowpath write.
 
 External callers get only `create_taskdeck_caller_intake_task`, which inserts a standalone task from their confirmed message and returns only a minimal result.
 
@@ -168,8 +168,12 @@ Legacy `TASKDECK_*` and `NEEDLE_*` database environment variables and local data
 
 ### Optional
 - `OPENAI_REALTIME_ENDPOINT` (runtime forces model query param to `gpt-realtime-2`)
-- `OPENAI_WEB_SEARCH_MODEL` (default `gpt-5.5`)
-- `OPENAI_WEB_SEARCH_CONTEXT_SIZE` (`low`, `medium`, or `high`; default `medium`)
+- `OPENAI_WEB_SEARCH_MODEL` (default `gpt-4.1-mini` for faster voice lookups)
+- `OPENAI_WEB_SEARCH_CONTEXT_SIZE` (`low`, `medium`, or `high`; default `low`)
+- `OPENAI_WEB_SEARCH_MAX_TOOL_CALLS` (default `1`; higher values allow deeper but slower searches)
+- `OPENAI_WEB_SEARCH_MAX_OUTPUT_TOKENS` (default `220`)
+- `OPENAI_WEB_SEARCH_REASONING_EFFORT` (`low`, `medium`, `high`, or `xhigh`; default `low` when using GPT-5/o-series search models)
+- `OPENAI_WEB_SEARCH_TIMEOUT_MS` (default `12000`)
 - `PHONE_RELAY_NUMBER`
 - `PORT` (default `8080`)
 - `VERBOSE_OPENAI_LOGS=true` for deeper event logs

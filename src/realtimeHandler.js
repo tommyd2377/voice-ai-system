@@ -26,6 +26,7 @@ const ASSISTANT_GREETING = "Hey, I'm Victoria, Tom's AI assistant. How can I hel
 const SELF_CALLER_GREETING = "Hey Tom, what's up?";
 const BARGE_IN_GRACE_MS = 500;
 const WEB_SEARCH_CONTEXT_SIZES = new Set(['low', 'medium', 'high']);
+const WEB_SEARCH_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
 
 const BASE_INSTRUCTIONS = `
 You are Victoria, the personal AI assistant and operator for Thomas DeVito.
@@ -706,8 +707,19 @@ const DEFAULT_REALTIME_ENDPOINT = (() => {
   }
 })();
 const DEFAULT_MODEL = 'gpt-realtime-2';
-const DEFAULT_WEB_SEARCH_MODEL = 'gpt-5.5';
-const DEFAULT_WEB_SEARCH_CONTEXT_SIZE = 'medium';
+const DEFAULT_WEB_SEARCH_MODEL = 'gpt-4.1-mini';
+const DEFAULT_WEB_SEARCH_CONTEXT_SIZE = 'low';
+const DEFAULT_WEB_SEARCH_MAX_OUTPUT_TOKENS = 220;
+const DEFAULT_WEB_SEARCH_MAX_TOOL_CALLS = 1;
+const DEFAULT_WEB_SEARCH_REASONING_EFFORT = 'low';
+const DEFAULT_WEB_SEARCH_TIMEOUT_MS = 12000;
+
+const VOICE_WEB_SEARCH_INSTRUCTIONS = `
+You are doing a quick public web lookup for a live voice conversation.
+Prioritize speed and answer only what was asked.
+Keep the summary under 90 words unless the user explicitly asked for detail.
+Mention source names when useful. Do not include long URLs.
+`.trim();
 
 const getWebSearchContextSize = () => {
   const configured = process.env.OPENAI_WEB_SEARCH_CONTEXT_SIZE?.trim().toLowerCase();
@@ -715,6 +727,54 @@ const getWebSearchContextSize = () => {
 };
 
 const getWebSearchModel = () => process.env.OPENAI_WEB_SEARCH_MODEL?.trim() || DEFAULT_WEB_SEARCH_MODEL;
+
+const getBoundedIntegerEnv = (name, fallback, min, max) => {
+  const parsed = Number.parseInt(process.env[name] || '', 10);
+  if (!Number.isInteger(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+};
+
+const getWebSearchMaxOutputTokens = () =>
+  getBoundedIntegerEnv('OPENAI_WEB_SEARCH_MAX_OUTPUT_TOKENS', DEFAULT_WEB_SEARCH_MAX_OUTPUT_TOKENS, 80, 800);
+
+const getWebSearchMaxToolCalls = () =>
+  getBoundedIntegerEnv('OPENAI_WEB_SEARCH_MAX_TOOL_CALLS', DEFAULT_WEB_SEARCH_MAX_TOOL_CALLS, 1, 5);
+
+const getWebSearchTimeoutMs = () =>
+  getBoundedIntegerEnv('OPENAI_WEB_SEARCH_TIMEOUT_MS', DEFAULT_WEB_SEARCH_TIMEOUT_MS, 2000, 60000);
+
+const getWebSearchReasoningEffort = () => {
+  const configured = process.env.OPENAI_WEB_SEARCH_REASONING_EFFORT?.trim().toLowerCase();
+  return WEB_SEARCH_REASONING_EFFORTS.has(configured) ? configured : DEFAULT_WEB_SEARCH_REASONING_EFFORT;
+};
+
+const supportsReasoningOptions = (model) => /^gpt-5(?:\.|-|$)/.test(model) || /^o\d/.test(model);
+
+const buildWebSearchRequestBody = ({ query, model, contextSize }) => {
+  const body = {
+    model,
+    instructions: VOICE_WEB_SEARCH_INSTRUCTIONS,
+    input: query,
+    tools: [
+      {
+        type: 'web_search',
+        search_context_size: contextSize,
+      },
+    ],
+    include: ['web_search_call.action.sources'],
+    tool_choice: 'required',
+    max_tool_calls: getWebSearchMaxToolCalls(),
+    max_output_tokens: getWebSearchMaxOutputTokens(),
+    store: false,
+  };
+
+  if (supportsReasoningOptions(model)) {
+    body.reasoning = { effort: getWebSearchReasoningEffort() };
+    body.text = { verbosity: 'low' };
+  }
+
+  return body;
+};
 
 const extractResponseText = (response) => {
   if (typeof response?.output_text === 'string' && response.output_text.trim()) {
@@ -778,25 +838,32 @@ export async function searchWeb(input = {}, options = {}) {
   const contextSize = WEB_SEARCH_CONTEXT_SIZES.has(input.searchContextSize)
     ? input.searchContextSize
     : getWebSearchContextSize();
-  const response = await fetchImpl('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: getWebSearchModel(),
-      input: query,
-      tools: [
-        {
-          type: 'web_search',
-          search_context_size: contextSize,
-        },
-      ],
-      include: ['web_search_call.action.sources'],
-      tool_choice: 'auto',
-    }),
-  });
+  const model = getWebSearchModel();
+  const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : getWebSearchTimeoutMs();
+  const abortController = typeof AbortController === 'function' ? new AbortController() : null;
+  const timeout = abortController
+    ? setTimeout(() => abortController.abort(), timeoutMs)
+    : null;
+
+  let response;
+  try {
+    response = await fetchImpl('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      signal: abortController?.signal,
+      body: JSON.stringify(buildWebSearchRequestBody({ query, model, contextSize })),
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`OpenAI web search timed out after ${timeoutMs}ms.`);
+    }
+    throw err;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -1425,7 +1492,7 @@ const SEARCH_WEB_TOOL = {
   type: 'function',
   name: 'search_web',
   description:
-    'Search the public web for the recognized self-caller. Use for current, local, volatile, or source-backed information. Never write Flowpath records from results without separate explicit confirmation.',
+    'Quickly search the public web for the recognized self-caller. Use for current, local, volatile, or source-backed information. Default to low context for voice speed unless Tom asks for a deeper search. Never write Flowpath records from results without separate explicit confirmation.',
   parameters: {
     type: 'object',
     properties: {
@@ -1433,7 +1500,7 @@ const SEARCH_WEB_TOOL = {
       searchContextSize: {
         type: 'string',
         enum: ['low', 'medium', 'high'],
-        description: 'Optional amount of search context. Defaults to configured medium.',
+        description: 'Optional amount of search context. Defaults to configured low for voice speed.',
       },
     },
     required: ['query'],
