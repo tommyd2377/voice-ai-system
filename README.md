@@ -148,6 +148,7 @@ The runtime function names still use `taskdeck_*` for compatibility, but Victori
 ### Required for deployed Flowpath voice access
 - `FLOWPATH_DATABASE_URL` (same libSQL/Turso database used by Flowpath)
 - `FLOWPATH_DATABASE_AUTH_TOKEN` if the shared database requires auth
+- `FLOWPATH_OWNER_LOCAL_USER_ID` (defaults to `1`; Victoria only reads/writes this Flowpath user)
 
 For local development, the voice service auto-detects the sibling Flowpath database at `../flowpath/data/flowpath.db` when present. You can also set:
 

@@ -14,6 +14,11 @@ const MAX_LIMIT = 25;
 
 let client = null;
 
+const getOwnerUserId = () => {
+  const parsed = Number.parseInt(process.env.FLOWPATH_OWNER_LOCAL_USER_ID || '1', 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 1;
+};
+
 const normalizeValue = (value) => {
   if (typeof value === 'bigint') return Number(value);
   return value;
@@ -178,22 +183,25 @@ async function insert(sql, args) {
 }
 
 async function getCounts() {
+  const ownerUserId = getOwnerUserId();
   const rows = await all(
-    `SELECT 'open_tasks' AS name, COUNT(*) AS count FROM tasks WHERE status = 'open'
-    UNION ALL SELECT 'active_projects', COUNT(*) FROM projects WHERE status = 'active'
-    UNION ALL SELECT 'active_situations', COUNT(*) FROM situations WHERE status = 'active'
-    UNION ALL SELECT 'life_areas', COUNT(*) FROM life_areas
-    UNION ALL SELECT 'recent_checkins', COUNT(*) FROM checkins
-    UNION ALL SELECT 'next_move_plans', COUNT(*) FROM next_move_plans`
+    `SELECT 'open_tasks' AS name, COUNT(*) AS count FROM tasks WHERE user_id = ? AND status = 'open'
+    UNION ALL SELECT 'active_projects', COUNT(*) FROM projects WHERE user_id = ? AND status = 'active'
+    UNION ALL SELECT 'active_situations', COUNT(*) FROM situations WHERE user_id = ? AND status = 'active'
+    UNION ALL SELECT 'life_areas', COUNT(*) FROM life_areas WHERE user_id = ?
+    UNION ALL SELECT 'recent_checkins', COUNT(*) FROM checkins WHERE user_id = ?
+    UNION ALL SELECT 'next_move_plans', COUNT(*) FROM next_move_plans WHERE user_id = ?`,
+    [ownerUserId, ownerUserId, ownerUserId, ownerUserId, ownerUserId, ownerUserId]
   );
 
   return Object.fromEntries(rows.map((row) => [row.name, row.count]));
 }
 
 async function resolveLifeAreaId({ lifeAreaId, lifeAreaName } = {}) {
+  const ownerUserId = getOwnerUserId();
   if (lifeAreaId != null && lifeAreaId !== '') {
     const id = positiveInteger(lifeAreaId, 'lifeAreaId');
-    const lifeArea = await first('SELECT id FROM life_areas WHERE id = ?', [id]);
+    const lifeArea = await first('SELECT id FROM life_areas WHERE id = ? AND user_id = ?', [id, ownerUserId]);
     if (!lifeArea) throw new Error(`No Flowpath life area exists with id ${id}.`);
     return id;
   }
@@ -202,17 +210,18 @@ async function resolveLifeAreaId({ lifeAreaId, lifeAreaName } = {}) {
   if (!name) return null;
 
   const lifeArea = await first(
-    'SELECT id FROM life_areas WHERE name = ? COLLATE NOCASE LIMIT 1',
-    [name]
+    'SELECT id FROM life_areas WHERE user_id = ? AND name = ? COLLATE NOCASE LIMIT 1',
+    [ownerUserId, name]
   );
   if (!lifeArea) throw new Error(`No Flowpath life area exists named "${name}".`);
   return lifeArea.id;
 }
 
 async function resolveProject({ projectId, projectName } = {}) {
+  const ownerUserId = getOwnerUserId();
   if (projectId != null && projectId !== '') {
     const id = positiveInteger(projectId, 'projectId');
-    const project = await first('SELECT id, life_area_id FROM projects WHERE id = ?', [id]);
+    const project = await first('SELECT id, life_area_id FROM projects WHERE id = ? AND user_id = ?', [id, ownerUserId]);
     if (!project) throw new Error(`No Flowpath project exists with id ${id}.`);
     return project;
   }
@@ -221,14 +230,15 @@ async function resolveProject({ projectId, projectName } = {}) {
   if (!name) return null;
 
   const project = await first(
-    'SELECT id, life_area_id FROM projects WHERE name = ? COLLATE NOCASE LIMIT 1',
-    [name]
+    'SELECT id, life_area_id FROM projects WHERE user_id = ? AND name = ? COLLATE NOCASE LIMIT 1',
+    [ownerUserId, name]
   );
   if (!project) throw new Error(`No Flowpath project exists named "${name}".`);
   return project;
 }
 
 async function getTask(taskId) {
+  const ownerUserId = getOwnerUserId();
   return first(
     `SELECT
       tasks.*,
@@ -236,15 +246,16 @@ async function getTask(taskId) {
       projects.name AS project_name,
       situations.title AS situation_title
     FROM tasks
-    LEFT JOIN life_areas ON life_areas.id = tasks.life_area_id
-    LEFT JOIN projects ON projects.id = tasks.project_id
-    LEFT JOIN situations ON situations.id = tasks.situation_id
-    WHERE tasks.id = ?`,
-    [taskId]
+    LEFT JOIN life_areas ON life_areas.id = tasks.life_area_id AND life_areas.user_id = tasks.user_id
+    LEFT JOIN projects ON projects.id = tasks.project_id AND projects.user_id = tasks.user_id
+    LEFT JOIN situations ON situations.id = tasks.situation_id AND situations.user_id = tasks.user_id
+    WHERE tasks.id = ? AND tasks.user_id = ?`,
+    [taskId, ownerUserId]
   );
 }
 
 export async function getTaskDeckBriefing(input = {}) {
+  const ownerUserId = getOwnerUserId();
   const topic = enumValue(
     input.topic,
     ['everything', 'tasks', 'projects', 'situations', 'today', 'memory'],
@@ -255,16 +266,17 @@ export async function getTaskDeckBriefing(input = {}) {
   const includeCompletedTasks = Boolean(input.includeCompletedTasks);
 
   const counts = await getCounts();
-  const profile = await first('SELECT * FROM profile WHERE id = 1');
+  const profile = await first('SELECT * FROM profile WHERE user_id = ? LIMIT 1', [ownerUserId]);
   const lifeAreas =
     topic === 'everything' || topic === 'projects' || topic === 'memory'
       ? await all(
           `SELECT * FROM life_areas
+          WHERE user_id = ?
           ORDER BY
             CASE priority_level WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
             name COLLATE NOCASE
           LIMIT ?`,
-          [limit]
+          [ownerUserId, limit]
         )
       : [];
 
@@ -273,15 +285,17 @@ export async function getTaskDeckBriefing(input = {}) {
       ? await all(
           `SELECT projects.*, life_areas.name AS life_area_name
           FROM projects
-          LEFT JOIN life_areas ON life_areas.id = projects.life_area_id
-          WHERE projects.status = 'active'
+          LEFT JOIN life_areas ON life_areas.id = projects.life_area_id AND life_areas.user_id = projects.user_id
+          WHERE projects.user_id = ? AND projects.status = 'active'
           ORDER BY projects.updated_at DESC, projects.name COLLATE NOCASE
           LIMIT ?`,
-          [limit]
+          [ownerUserId, limit]
         )
       : [];
 
-  const taskWhere = includeCompletedTasks ? '' : "WHERE tasks.status = 'open'";
+  const taskWhere = includeCompletedTasks
+    ? 'WHERE tasks.user_id = ?'
+    : "WHERE tasks.user_id = ? AND tasks.status = 'open'";
   const tasks =
     topic === 'everything' || topic === 'tasks' || topic === 'today'
       ? await all(
@@ -291,9 +305,9 @@ export async function getTaskDeckBriefing(input = {}) {
             projects.name AS project_name,
             situations.title AS situation_title
           FROM tasks
-          LEFT JOIN life_areas ON life_areas.id = tasks.life_area_id
-          LEFT JOIN projects ON projects.id = tasks.project_id
-          LEFT JOIN situations ON situations.id = tasks.situation_id
+          LEFT JOIN life_areas ON life_areas.id = tasks.life_area_id AND life_areas.user_id = tasks.user_id
+          LEFT JOIN projects ON projects.id = tasks.project_id AND projects.user_id = tasks.user_id
+          LEFT JOIN situations ON situations.id = tasks.situation_id AND situations.user_id = tasks.user_id
           ${taskWhere}
           ORDER BY
             CASE tasks.status WHEN 'open' THEN 1 WHEN 'ignored' THEN 2 ELSE 3 END,
@@ -301,7 +315,7 @@ export async function getTaskDeckBriefing(input = {}) {
             tasks.effort ASC,
             tasks.created_at DESC
           LIMIT ?`,
-          [limit]
+          [ownerUserId, limit]
         )
       : [];
 
@@ -316,16 +330,16 @@ export async function getTaskDeckBriefing(input = {}) {
           FROM situations
           LEFT JOIN next_move_plans latest_plan ON latest_plan.id = (
             SELECT id FROM next_move_plans
-            WHERE situation_id = situations.id
+            WHERE user_id = situations.user_id AND situation_id = situations.id
             ORDER BY created_at DESC
             LIMIT 1
           )
-          WHERE situations.status = 'active'
+          WHERE situations.user_id = ? AND situations.status = 'active'
           ORDER BY
             CASE situations.urgency WHEN 'crisis' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
             situations.updated_at DESC
           LIMIT ?`,
-          [limit]
+          [ownerUserId, limit]
         )
       : [];
 
@@ -342,10 +356,11 @@ export async function getTaskDeckBriefing(input = {}) {
             json_extract(next_move_plans.highest_leverage_move_json, '$.title') AS highest_leverage_move,
             next_move_plans.created_at
           FROM next_move_plans
-          LEFT JOIN situations ON situations.id = next_move_plans.situation_id
+          LEFT JOIN situations ON situations.id = next_move_plans.situation_id AND situations.user_id = next_move_plans.user_id
+          WHERE next_move_plans.user_id = ?
           ORDER BY next_move_plans.created_at DESC
           LIMIT ?`,
-          [limit]
+          [ownerUserId, limit]
         )
       : [];
 
@@ -353,9 +368,10 @@ export async function getTaskDeckBriefing(input = {}) {
     topic === 'everything' || topic === 'today'
       ? await all(
           `SELECT * FROM checkins
+          WHERE user_id = ?
           ORDER BY checkin_date DESC, created_at DESC
           LIMIT ?`,
-          [Math.min(limit, 5)]
+          [ownerUserId, Math.min(limit, 5)]
         )
       : [];
 
@@ -372,9 +388,10 @@ export async function getTaskDeckBriefing(input = {}) {
             minimum_viable_day,
             created_at
           FROM plans
+          WHERE user_id = ?
           ORDER BY plan_date DESC, created_at DESC
           LIMIT ?`,
-          [Math.min(limit, 5)]
+          [ownerUserId, Math.min(limit, 5)]
         )
       : [];
 
@@ -399,6 +416,7 @@ export async function createTaskDeckTask(input = {}) {
     return { ok: false, reason: 'confirmation_required' };
   }
 
+  const ownerUserId = getOwnerUserId();
   const title = textOrDefault(input.title, '', 220);
   if (!title) throw new Error('title is required.');
 
@@ -414,9 +432,10 @@ export async function createTaskDeckTask(input = {}) {
 
   const taskId = await insert(
     `INSERT INTO tasks (
-      title, life_area_id, project_id, status, importance, effort, due_date, notes, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      user_id, title, life_area_id, project_id, status, importance, effort, due_date, notes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      ownerUserId,
       title,
       lifeAreaId,
       project?.id ?? null,
@@ -441,6 +460,7 @@ export async function createTaskDeckCallerIntakeTask(input = {}) {
     return { ok: false, reason: 'confirmation_required' };
   }
 
+  const ownerUserId = getOwnerUserId();
   const subject = textOrDefault(input.subject, 'Voice message', 160);
   const messageBody = textOrDefault(input.messageBody, '', 5000);
   if (!messageBody) throw new Error('messageBody is required.');
@@ -478,9 +498,9 @@ export async function createTaskDeckCallerIntakeTask(input = {}) {
 
   const taskId = await insert(
     `INSERT INTO tasks (
-      title, life_area_id, project_id, status, importance, effort, due_date, notes, created_at, updated_at
-    ) VALUES (?, NULL, NULL, 'open', ?, 2, NULL, ?, ?, ?)`,
-    [title, importanceByPriority[priority], notes, now, now]
+      user_id, title, life_area_id, project_id, status, importance, effort, due_date, notes, created_at, updated_at
+    ) VALUES (?, ?, NULL, NULL, 'open', ?, 2, NULL, ?, ?, ?)`,
+    [ownerUserId, title, importanceByPriority[priority], notes, now, now]
   );
 
   return {
@@ -495,6 +515,7 @@ export async function updateTaskDeckTask(input = {}) {
     return { ok: false, reason: 'confirmation_required' };
   }
 
+  const ownerUserId = getOwnerUserId();
   const taskId = positiveInteger(input.taskId, 'taskId');
   const existing = await getTask(taskId);
   if (!existing) throw new Error(`No Flowpath task exists with id ${taskId}.`);
@@ -555,9 +576,9 @@ export async function updateTaskDeckTask(input = {}) {
   }
 
   updates.push('updated_at = ?');
-  args.push(nowIso(), taskId);
+  args.push(nowIso(), taskId, ownerUserId);
 
-  await run(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`, args);
+  await run(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ? AND user_id = ?`, args);
 
   return {
     ok: true,
@@ -571,16 +592,18 @@ export async function createTaskDeckCheckIn(input = {}) {
     return { ok: false, reason: 'confirmation_required' };
   }
 
+  const ownerUserId = getOwnerUserId();
   if (input.energyLevel == null || input.energyLevel === '') {
     throw new Error('energyLevel is required.');
   }
   const energyLevel = integerInRange(input.energyLevel, 'energyLevel', 1, 10, null);
   const id = await insert(
     `INSERT INTO checkins (
-      checkin_date, energy_level, mood, sleep, health_status,
+      user_id, checkin_date, energy_level, mood, sleep, health_status,
       main_thing, resistance, brain_dump, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      ownerUserId,
       todayIsoDate(),
       energyLevel,
       textOrDefault(input.mood, '', 1000),
@@ -595,7 +618,7 @@ export async function createTaskDeckCheckIn(input = {}) {
 
   return {
     ok: true,
-    checkIn: await first('SELECT * FROM checkins WHERE id = ?', [id]),
+    checkIn: await first('SELECT * FROM checkins WHERE id = ? AND user_id = ?', [id, ownerUserId]),
   };
 }
 
@@ -604,6 +627,7 @@ export async function createTaskDeckSituation(input = {}) {
     return { ok: false, reason: 'confirmation_required' };
   }
 
+  const ownerUserId = getOwnerUserId();
   const title = textOrDefault(input.title, '', 180);
   if (!title) throw new Error('title is required.');
 
@@ -611,22 +635,23 @@ export async function createTaskDeckSituation(input = {}) {
   const urgency = enumValue(input.urgency, ['low', 'medium', 'high', 'crisis'], 'medium', 'urgency');
   const now = nowIso();
   const situationId = await insert(
-    `INSERT INTO situations (title, category, status, urgency, created_at, updated_at)
-    VALUES (?, ?, 'active', ?, ?, ?)`,
-    [title, category, urgency, now, now]
+    `INSERT INTO situations (user_id, title, category, status, urgency, created_at, updated_at)
+    VALUES (?, ?, ?, 'active', ?, ?, ?)`,
+    [ownerUserId, title, category, urgency, now, now]
   );
 
   const sessionId = await insert(
     `INSERT INTO intake_sessions (
-      situation_id, current_stage, is_complete, summary_so_far, created_at, updated_at
-    ) VALUES (?, 'understanding_goals', 0, ?, ?, ?)`,
-    [situationId, textOrDefault(input.summary, '', 5000), now, now]
+      user_id, situation_id, current_stage, is_complete, summary_so_far, created_at, updated_at
+    ) VALUES (?, ?, 'understanding_goals', 0, ?, ?, ?)`,
+    [ownerUserId, situationId, textOrDefault(input.summary, '', 5000), now, now]
   );
 
   await insert(
-    `INSERT INTO intake_messages (session_id, role, content, created_at)
-    VALUES (?, 'assistant', ?, ?)`,
+    `INSERT INTO intake_messages (user_id, session_id, role, content, created_at)
+    VALUES (?, ?, 'assistant', ?, ?)`,
     [
+      ownerUserId,
       sessionId,
       'What do you most want to change about this situation, and what would feel meaningfully different if Flowpath helped you make progress?',
       now,
@@ -635,7 +660,7 @@ export async function createTaskDeckSituation(input = {}) {
 
   return {
     ok: true,
-    situation: await first('SELECT * FROM situations WHERE id = ?', [situationId]),
-    session: await first('SELECT * FROM intake_sessions WHERE id = ?', [sessionId]),
+    situation: await first('SELECT * FROM situations WHERE id = ? AND user_id = ?', [situationId, ownerUserId]),
+    session: await first('SELECT * FROM intake_sessions WHERE id = ? AND user_id = ?', [sessionId, ownerUserId]),
   };
 }
