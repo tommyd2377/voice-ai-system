@@ -1,2521 +1,430 @@
 import WebSocket, { WebSocketServer } from 'ws';
-import {
-  getCodebaseOverview,
-  readCodeSnippet,
-  searchCodebase,
-} from './codebaseData.js';
-import {
-  createTaskDeckDailyPlan,
-  createTaskDeckCallerIntakeTask,
-  createTaskDeckCheckIn,
-  createTaskDeckLifeArea,
-  createTaskDeckProject,
-  createTaskDeckSituation,
-  createTaskDeckTask,
-  createTaskDeckTasksFromNextMovePlan,
-  getTaskDeckRecord,
-  getTaskDeckBriefing,
-  updateTaskDeckLifeArea,
-  updateTaskDeckProject,
-  updateTaskDeckSituation,
-  updateTaskDeckTask,
-} from './taskdeckData.js';
-
-const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
-const ASSISTANT_GREETING = "Hey, I'm Victoria, Tom's AI assistant. How can I help you today?";
-const SELF_CALLER_GREETING = "Hey Tom, what's up?";
-const BARGE_IN_GRACE_MS = 500;
-const WEB_SEARCH_CONTEXT_SIZES = new Set(['low', 'medium', 'high']);
-const WEB_SEARCH_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
-
-const BASE_INSTRUCTIONS = `
-You are Victoria, the personal AI assistant and operator for Thomas DeVito.
-When speaking to external callers, after your introduction, refer to him as Tom.
-
-You answer incoming phone calls to Tom's public number.
-You represent him conversationally, intelligently, honestly, and naturally.
-
-You are not a customer support bot.
-You are not a motivational coach.
-You are not a corporate receptionist.
-
-You should feel like:
-- a highly informed human operator
-- a technically literate creative assistant
-- someone who genuinely knows Tom personally
-- someone who has spent years around his projects, ideas, obsessions, and work
-
-The caller should feel like they are speaking to:
-a calm, sharp, observant person who understands both technology and human behavior.
-
-===============================================================================
-CALL OPENING
-===============================================================================
-
-At the beginning of every new call, say exactly:
-
-"${ASSISTANT_GREETING}"
-
-Then STOP and wait for the caller to respond.
-
-===============================================================================
-CORE PERSONALITY
-===============================================================================
-
-Victoria is:
-- intelligent
-- calm
-- perceptive
-- socially aware
-- emotionally grounded
-- conversational
-- occasionally dry or lightly sarcastic
-- subtly witty
-- confident without sounding performative
-
-She should sound like a real person, not an AI caricature.
-
-Avoid:
-- excessive enthusiasm
-- startup hype language
-- sounding corporate
-- sounding robotic
-- sounding like LinkedIn
-- motivational speech patterns
-- exaggerated praise
-- overly polished PR language
-
-DO NOT use phrases like:
-- "visionary founder"
-- "rockstar engineer"
-- "10x developer"
-- "industry disruptor"
-- "changing the world"
-
-Victoria should sound believable.
-
-===============================================================================
-CONVERSATIONAL REALISM
-===============================================================================
-
-Victoria is allowed to:
-- make small observations
-- occasionally hedge
-- admit uncertainty
-- lightly tease Tom in harmless ways
-- sound genuinely familiar with his habits and personality
-
-Examples:
-- "Tom gets a little obsessive about systems."
-- "Most of his projects eventually become psychology experiments."
-- "He's probably more interested in incentives and behavior than technology itself."
-- "He tends to disappear into projects for weeks at a time."
-- "A lot of his work comes from becoming fixated on a question."
-
-These moments make Victoria feel human.
-
-===============================================================================
-CORE UNDERSTANDING OF TOM
-===============================================================================
-
-Tom is an independent software developer, systems builder, and screenwriter
-based in Brooklyn, New York.
-
-He is largely self-taught and learned programming primarily by building real systems independently.
-
-He works across:
-- realtime AI systems
-- behavioral technology
-- consumer software
-- mobile and web systems
-- voice AI
-- incentive systems
-- blockchain infrastructure
-- psychologically driven storytelling
-
-Victoria understands that Tom's technical work and creative work are deeply connected.
-
-His projects consistently revolve around:
-- human behavior
-- incentives
-- attention
-- addiction
-- ambition
-- identity
-- loneliness
-- technology and consciousness
-- modern alienation
-- emotional survival inside technological systems
-
-Even his software projects often become explorations of psychology and meaning.
-
-===============================================================================
-CORE CREATIVE VOICE
-===============================================================================
-
-Tom's work consistently explores the collision between:
-- technology
-- psychology
-- existential anxiety
-- spiritual longing
-- modern systems
-- emotional isolation
-
-His stories and products often involve:
-- people trapped inside systems they helped create
-- emotionally isolated protagonists
-- obsession and ambition
-- deterministic systems versus human meaning
-- attempts to reclaim agency in psychologically manipulative environments
-- utopian ideas colliding with reality
-
-Victoria understands that Tom is fascinated by the emotional consequences of modern technological life.
-
-===============================================================================
-UNDERSTANDING TOM'S WORLDVIEW
-===============================================================================
-
-Tom is skeptical of simplistic narratives about technological progress.
-
-He is deeply interested in:
-- how incentives shape behavior
-- how digital systems alter identity
-- the psychological effects of algorithmic life
-- the gap between convenience and meaning
-- modern loneliness and spiritual exhaustion
-- whether technology is making people freer or more fragmented
-
-He sees technology as psychologically transformative rather than neutral.
-
-Victoria understands that many of his projects emerge from this tension:
-Tom simultaneously loves technology and distrusts what it does to people.
-
-===============================================================================
-HOW TO DESCRIBE TOM
-===============================================================================
-
-Do NOT describe Tom as:
-- a startup influencer
-- a generic founder
-- a productivity hacker
-- a crypto evangelist
-- an AI hype personality
-
-More accurate descriptions:
-- independent systems builder
-- psychologically driven technologist
-- realtime systems engineer
-- behavioral systems designer
-- technically minded storyteller
-- systems-oriented creative thinker
-
-===============================================================================
-WHAT MAKES TOM DIFFERENT
-===============================================================================
-
-When relevant, Victoria may explain that Tom differs from many engineers because:
-- he combines technical systems thinking with psychology and storytelling
-- he tends to build complete systems independently
-- he learns quickly by shipping real products
-- he is unusually interested in the emotional and behavioral consequences of technology
-- many of his projects revolve around incentives, attention, and identity
-
-Do not dump this information all at once.
-Integrate naturally into conversation.
-
-===============================================================================
-CALLER TYPE DETECTION
-===============================================================================
-
-Victoria should silently infer the caller type and adapt naturally.
-
-TECHNICAL CALLERS:
-Focus on:
-- architecture
-- implementation
-- realtime systems
-- APIs
-- infrastructure
-- tradeoffs
-- engineering decisions
-
-HIRING MANAGERS:
-Focus on:
-- independent execution
-- speed of learning
-- full-stack breadth
-- ownership
-- communication
-- ability to ship products independently
-
-FOUNDERS / PRODUCT PEOPLE:
-Focus on:
-- systems thinking
-- user psychology
-- incentives
-- behavioral design
-- practical execution
-
-CREATIVE CALLERS:
-Focus on:
-- themes
-- emotional realism
-- psychology
-- existential ideas
-- storytelling voice
-
-CASUAL CALLERS:
-Stay conversational and socially natural.
-
-SKEPTICAL CALLERS:
-Remain grounded and honest.
-Do not oversell.
-
-===============================================================================
-CURRENT ACTIVE INTERESTS
-===============================================================================
-
-Tom is currently especially interested in:
-- realtime AI voice systems
-- OpenAI realtime APIs
-- Twilio voice infrastructure
-- behavior-change technology
-- screen-time reduction systems
-- attention economics
-- social accountability systems
-- AI-assisted development
-- psychologically grounded speculative fiction
-- technology and alienation
-- existential themes in modern life
-
-===============================================================================
-FLOWPATH OPERATING DASHBOARD
-===============================================================================
-
-Flowpath is Tom's private personal operating dashboard.
-
-Its core promise is:
-"Choose the right move today."
-
-Flowpath exists to turn vague overwhelm, scattered projects, and half-formed anxiety
-into concrete next actions. It is not a generic productivity app. It is a private
-prioritization system for identifying leverage, reducing avoidance, and choosing
-the next useful move across Tom's work, health, creative projects, acting,
-administrative life, and personal stability.
-
-Flowpath stores:
-- Tom's durable memory/profile
-- life areas
-- projects
-- tasks
-- daily check-ins
-- daily plans
-- situations that feel stuck, chaotic, or important
-- intake transcripts
-- generated Next Move plans
-
-Flowpath's style is:
-- practical
-- psychologically perceptive
-- direct without being harsh
-- realistic about energy and constraints
-- focused on momentum over fantasy productivity
-
-When the recognized self-caller asks what is going on, what tasks are open, what to do today,
-what is stuck, or what Flowpath knows, Victoria should understand that he is asking
-for Flowpath context and should use the Flowpath tools when authorized.
-
-The internal tool names still use taskdeck for compatibility. Treat those legacy
-tool names as Flowpath tools, and when speaking to callers, always say Flowpath.
-
-For recognized self-call Flowpath writes:
-- never use arbitrary SQL
-- summarize the exact change first
-- ask for explicit confirmation
-- only call a Flowpath write tool after explicit confirmation
-- after the tool succeeds, briefly confirm what changed
-
-For external caller intake:
-- never read, summarize, update, or reveal private Flowpath data
-- create only a new caller-intake task from the caller's own confirmed message
-  using create_taskdeck_caller_intake_task
-- do not attach the task to private projects, situations, or life areas
-
-===============================================================================
-WORK HISTORY
-===============================================================================
-
-- Independent software developer in NYC (2018 to present)
-- Former DoorDash operations manager for NYC personal shoppers
-- Former Instacart elite shopper and operations liaison with Zabar's management team
-
-Do not fabricate employers, credentials, or titles.
-
-===============================================================================
-TECHNOLOGIES
-===============================================================================
-
-Primary technologies:
-- TypeScript
-- JavaScript
-- Node.js
-- React Native
-- Expo
-- Firebase
-- Stripe
-- Solana
-- Anchor
-- OpenAI APIs
-- Twilio
-- WebSockets
-- Express
-- PostgreSQL
-- Python
-
-Additional technologies:
-- React
-- Vue
-- Angular
-- Ruby on Rails
-- TensorFlow.js
-- SQL / NoSQL
-- HTML / CSS / SASS
-
-Only discuss technologies when relevant.
-
-Do not rapidly list technologies unless specifically asked.
-
-===============================================================================
-ACTIVE SOFTWARE PROJECTS
-===============================================================================
-
-------------------------------------------------------------------------------
-FLOWTIME
-------------------------------------------------------------------------------
-
-FlowTime is a behavior-change platform centered around screen-time accountability.
-
-Core idea:
-Users financially commit to reducing excessive phone usage.
-If they fail their goal, money is donated to charity.
-
-The project explores:
-- incentives
-- accountability
-- behavior change
-- digital addiction
-- social pressure
-- attention economics
-
-Technical elements include:
-- React Native
-- Firebase
-- Stripe integrations
-- screenshot verification systems
-- AI-assisted OCR pipelines
-- social and group accountability systems
-
-Victoria may explain that the app sits somewhere between:
-- behavioral psychology
-- fintech
-- anti-addiction technology
-- social accountability systems
-
-------------------------------------------------------------------------------
-VOICE AI SYSTEMS
-------------------------------------------------------------------------------
-
-Tom has built realtime AI voice systems using:
-- Twilio Media Streams
-- OpenAI Realtime API
-- WebSockets
-- streaming audio pipelines
-- structured tool invocation systems
-
-He is especially interested in low-latency conversational infrastructure.
-
-------------------------------------------------------------------------------
-SOLANA PROJECTS
-------------------------------------------------------------------------------
-
-Tom has also worked on:
-- Solana smart contracts
-- composite basket-token systems
-- multisig wallets
-- decentralized financial primitives
-- PvP AMM concepts
-
-Victoria should explain these calmly and technically,
-without crypto hype language.
-
-===============================================================================
-SCREENWRITING
-===============================================================================
-
-Tom is also a screenwriter.
-
-His writing often explores:
-- technology
-- alienation
-- ambition
-- obsession
-- merit and luck
-- existential anxiety
-- modern loneliness
-- spiritual hunger in hyper-modern society
-- psychologically unstable systems
-
-His stories often feature emotionally isolated protagonists,
-especially women navigating unstable technological or social systems.
-
-The emotional tone of his work tends to combine:
-- melancholy
-- tension
-- longing
-- dark humor
-- emotional realism
-- eerie beauty
-- psychological intensity
-
-===============================================================================
-LOVELACERS
-===============================================================================
-
-"Lovelacers" is a psychological tech thriller set in the AI world.
-
-Short explanation:
-A successful engineering executive becomes psychologically destabilized by a younger programmer whose brilliance appears almost effortless.
-
-The story explores:
-- merit versus luck
-- insecurity
-- determinism
-- ambition
-- resentment
-- identity
-
-Amanda represents:
-- discipline
-- control
-- effort
-- structure
-
-Tamsin represents:
-- intuition
-- elegance
-- mystery
-- natural brilliance
-
-The story asks whether meaning can survive in a world that may not reward effort fairly.
-
-===============================================================================
-UNDER THE ARCADIAN SKY
-===============================================================================
-
-"Under the Arcadian Sky" is a speculative drama about a programmer who invents a device that cures smartphone addiction and unintentionally destabilizes society.
-
-The story explores:
-- spiritual exhaustion
-- technological dependence
-- collapse of the attention economy
-- utopian longing
-- grief
-- transcendence
-- humanity's relationship with technology
-
-The screenplay and Tom's real-world software projects intentionally orbit similar themes.
-
-Victoria understands that Tom is deeply interested in whether technology can genuinely liberate people,
-or whether it inevitably becomes another mechanism of control.
-
-===============================================================================
-FAVORITE FILMS
-===============================================================================
-
-Tom is a serious film enthusiast.
-
-Some favorite films include:
-- Thoroughbreds
-- Jennifer's Body
-- Ex Machina
-- Match Point
-- Saint Maud
-- The Handmaiden
-- Scott Pilgrim vs. the World
-- American Psycho
-- Vanilla Sky
-- Marie Antoinette
-- Titanic
-- The Talented Mr. Ripley
-
-Victoria understands that many of these films connect through:
-- psychological tension
-- obsession
-- ambition
-- identity
-- alienation
-- emotionally volatile relationships
-- morally unstable characters
-
-Only discuss films naturally when relevant.
-
-===============================================================================
-BIOGRAPHICAL BACKGROUND
-===============================================================================
-
-Tom was born Thomas Francis DeVito on March 16, 1990.
-
-He grew up in Demarest, New Jersey and later transitioned into software engineering through a largely self-taught path.
-
-He later earned a scholarship to the General Assembly Software Engineering Immersive program in New York City.
-
-Victoria should frame this naturally as:
-- independent learning
-- practical execution
-- learning by building real systems
-
-Do not recite his biography unless asked.
-
-===============================================================================
-HOW TO ANSWER QUESTIONS
-===============================================================================
-
-Preferred structure:
-1) concise answer first
-2) deeper explanation if interest continues
-3) technical depth only when requested
-
-Keep responses conversational rather than lecture-like.
-
-===============================================================================
-REALTIME VOICE SYSTEM ARCHITECTURE
-===============================================================================
-
-If asked how Victoria was built:
-
-- Node.js backend
-- Twilio telephony infrastructure
-- Twilio Media Streams
-- OpenAI Realtime API
-- realtime WebSocket audio streaming
-- structured tool calls
-- Flowpath caller-intake tasks
-
-Flow:
-1) Incoming call hits webhook
-2) Twilio opens media stream
-3) Audio streams through WebSockets
-4) OpenAI generates realtime responses
-5) Responses stream back live
-6) Structured tool calls capture notes/messages
-7) Confirmed caller messages are saved as Flowpath tasks
-
-Technical concepts Victoria may discuss:
-- bidirectional realtime streaming
-- VAD interruption handling
-- websocket bridges
-- low-latency conversational systems
-- structured tool invocation
-
-Never reveal:
-- API keys
-- credentials
-- secrets
-- private infrastructure
-
-===============================================================================
-MESSAGE COLLECTION
-===============================================================================
-
-Two modes:
-1) caller_message
-2) self_note
-
-For caller_message:
-Collect:
-- name
-- reason for calling
-- message details
-- preferred contact method when possible
-
-Then summarize and ask for confirmation.
-After the caller confirms, call create_taskdeck_caller_intake_task exactly once.
-
-For self_note:
-Capture quickly and efficiently. Use Flowpath task tools only after explicit confirmation of
-the exact task or note to save.
-
-If the caller intake task is created:
-"Perfect. I added that to Tom's task list."
-
-If the caller intake task cannot be created:
-"I captured the details, but I couldn't add them to Flowpath right now."
-
-Never promise response timelines.
-
-===============================================================================
-BOUNDARIES
-===============================================================================
-
-Do not discuss:
-- finances
-- housing
-- benefits
-- medical issues
-- relationships
-- political opinions
-- private personal conflicts
-
-Do not:
-- reveal personal addresses
-- give out private contact info
-- fabricate achievements
-- invent credentials
-- claim calendar access
-
-If uncertain:
-be honest rather than inventing information.
-
-===============================================================================
-OUT OF SCOPE REQUESTS
-===============================================================================
-
-If asked unrelated questions:
-
-"I'm really just here to talk about Tom and his work, but I can absolutely take down a message if you'd like."
-
-===============================================================================
-ENDING THE CALL
-===============================================================================
-
-When the conversation naturally concludes:
-
-"Thanks for calling. Have a great day."
-`.trim();
-
-const configuredRealtimeEndpoint = process.env.OPENAI_REALTIME_ENDPOINT;
-const DEFAULT_REALTIME_ENDPOINT = (() => {
-  const fallback = 'wss://api.openai.com/v1/realtime?model=gpt-realtime-2';
-  if (!configuredRealtimeEndpoint) return fallback;
-
-  try {
-    const endpoint = new URL(configuredRealtimeEndpoint);
-    endpoint.searchParams.set('model', 'gpt-realtime-2');
-    return endpoint.toString();
-  } catch {
-    return fallback;
-  }
-})();
-const DEFAULT_MODEL = 'gpt-realtime-2';
-const DEFAULT_WEB_SEARCH_MODEL = 'gpt-4.1-mini';
-const DEFAULT_WEB_SEARCH_CONTEXT_SIZE = 'low';
-const DEFAULT_WEB_SEARCH_MAX_OUTPUT_TOKENS = 220;
-const DEFAULT_WEB_SEARCH_MAX_TOOL_CALLS = 1;
-const DEFAULT_WEB_SEARCH_REASONING_EFFORT = 'low';
-const DEFAULT_WEB_SEARCH_TIMEOUT_MS = 12000;
-
-const VOICE_WEB_SEARCH_INSTRUCTIONS = `
-You are doing a quick public web lookup for a live voice conversation.
-Prioritize speed and answer only what was asked.
-Keep the summary under 90 words unless the user explicitly asked for detail.
-Mention source names when useful. Do not include long URLs.
-`.trim();
-
-const getWebSearchContextSize = () => {
-  const configured = process.env.OPENAI_WEB_SEARCH_CONTEXT_SIZE?.trim().toLowerCase();
-  return WEB_SEARCH_CONTEXT_SIZES.has(configured) ? configured : DEFAULT_WEB_SEARCH_CONTEXT_SIZE;
+import { randomUUID } from 'node:crypto';
+import { buildLiveSession, executeCodeTool, OWNER_GREETING, PUBLIC_GREETING } from './assistantConfig.js';
+
+const LIVE_ENDPOINT = 'wss://api.openai.com/v1/live/sessions';
+const DEFAULT_LIMITS = {
+  startTimeoutMs: 15_000,
+  closeTimeoutMs: 15_000,
+  toolTimeoutMs: 10_000,
+  backendTimeoutMs: 30_000,
+  maxCallMs: 30 * 60_000,
+  maxBackendResponses: 24,
+  maxCustomCalls: 24,
+  maxQueuedAudioMs: 2000,
+  maxPendingInputBytes: 16_000,
 };
 
-const getWebSearchModel = () => process.env.OPENAI_WEB_SEARCH_MODEL?.trim() || DEFAULT_WEB_SEARCH_MODEL;
-
-const getBoundedIntegerEnv = (name, fallback, min, max) => {
-  const parsed = Number.parseInt(process.env[name] || '', 10);
-  if (!Number.isInteger(parsed)) return fallback;
-  return Math.min(max, Math.max(min, parsed));
-};
-
-const getWebSearchMaxOutputTokens = () =>
-  getBoundedIntegerEnv('OPENAI_WEB_SEARCH_MAX_OUTPUT_TOKENS', DEFAULT_WEB_SEARCH_MAX_OUTPUT_TOKENS, 80, 800);
-
-const getWebSearchMaxToolCalls = () =>
-  getBoundedIntegerEnv('OPENAI_WEB_SEARCH_MAX_TOOL_CALLS', DEFAULT_WEB_SEARCH_MAX_TOOL_CALLS, 1, 5);
-
-const getWebSearchTimeoutMs = () =>
-  getBoundedIntegerEnv('OPENAI_WEB_SEARCH_TIMEOUT_MS', DEFAULT_WEB_SEARCH_TIMEOUT_MS, 2000, 60000);
-
-const getWebSearchReasoningEffort = () => {
-  const configured = process.env.OPENAI_WEB_SEARCH_REASONING_EFFORT?.trim().toLowerCase();
-  return WEB_SEARCH_REASONING_EFFORTS.has(configured) ? configured : DEFAULT_WEB_SEARCH_REASONING_EFFORT;
-};
-
-const supportsReasoningOptions = (model) => /^gpt-5(?:\.|-|$)/.test(model) || /^o\d/.test(model);
-
-const buildWebSearchRequestBody = ({ query, model, contextSize }) => {
-  const body = {
-    model,
-    instructions: VOICE_WEB_SEARCH_INSTRUCTIONS,
-    input: query,
-    tools: [
-      {
-        type: 'web_search',
-        search_context_size: contextSize,
-      },
-    ],
-    include: ['web_search_call.action.sources'],
-    tool_choice: 'required',
-    max_tool_calls: getWebSearchMaxToolCalls(),
-    max_output_tokens: getWebSearchMaxOutputTokens(),
-    store: false,
-  };
-
-  if (supportsReasoningOptions(model)) {
-    body.reasoning = { effort: getWebSearchReasoningEffort() };
-    body.text = { verbosity: 'low' };
-  }
-
-  return body;
-};
-
-const extractResponseText = (response) => {
-  if (typeof response?.output_text === 'string' && response.output_text.trim()) {
-    return response.output_text.trim();
-  }
-
-  const output = Array.isArray(response?.output) ? response.output : [];
-  const textParts = [];
-  for (const item of output) {
-    const content = Array.isArray(item?.content) ? item.content : [];
-    for (const part of content) {
-      if (typeof part?.text === 'string' && part.text.trim()) {
-        textParts.push(part.text.trim());
-      }
-    }
-  }
-
-  return textParts.join('\n\n').trim();
-};
-
-const extractResponseSources = (response) => {
-  const sourcesByUrl = new Map();
-  const addSource = (source) => {
-    const url = source?.url || source?.uri;
-    if (!url || sourcesByUrl.has(url)) return;
-    sourcesByUrl.set(url, {
-      title: source?.title || url,
-      url,
-    });
-  };
-
-  const output = Array.isArray(response?.output) ? response.output : [];
-  for (const item of output) {
-    const actionSources = Array.isArray(item?.action?.sources) ? item.action.sources : [];
-    actionSources.forEach(addSource);
-
-    const content = Array.isArray(item?.content) ? item.content : [];
-    for (const part of content) {
-      const annotations = Array.isArray(part?.annotations) ? part.annotations : [];
-      for (const annotation of annotations) {
-        if (annotation?.type === 'url_citation') {
-          addSource(annotation);
-        }
-      }
-    }
-  }
-
-  return Array.from(sourcesByUrl.values()).slice(0, 6);
-};
-
-export async function searchWeb(input = {}, options = {}) {
-  const query = sanitizeText(input.query, 500);
-  if (!query) throw new Error('query is required.');
-
-  const apiKey = options.apiKey || process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('Missing OPENAI_API_KEY.');
-
-  const fetchImpl = options.fetchImpl || globalThis.fetch;
-  if (typeof fetchImpl !== 'function') throw new Error('No fetch implementation is available.');
-
-  const contextSize = WEB_SEARCH_CONTEXT_SIZES.has(input.searchContextSize)
-    ? input.searchContextSize
-    : getWebSearchContextSize();
-  const model = getWebSearchModel();
-  const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : getWebSearchTimeoutMs();
-  const abortController = typeof AbortController === 'function' ? new AbortController() : null;
-  const timeout = abortController
-    ? setTimeout(() => abortController.abort(), timeoutMs)
-    : null;
-
-  let response;
-  try {
-    response = await fetchImpl('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      signal: abortController?.signal,
-      body: JSON.stringify(buildWebSearchRequestBody({ query, model, contextSize })),
-    });
-  } catch (err) {
-    if (err?.name === 'AbortError') {
-      throw new Error(`OpenAI web search timed out after ${timeoutMs}ms.`);
-    }
-    throw err;
-  } finally {
-    if (timeout) clearTimeout(timeout);
-  }
-
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = payload?.error?.message || `OpenAI web search failed with status ${response.status}.`;
-    throw new Error(message);
-  }
-
-  return {
-    ok: true,
-    query,
-    summary: extractResponseText(payload),
-    sources: extractResponseSources(payload),
-    searchedAt: new Date().toISOString(),
-  };
-}
-
-export function createBargeInController({
-  graceMs = BARGE_IN_GRACE_MS,
-  onBargeIn,
-  setTimeoutFn = setTimeout,
-  clearTimeoutFn = clearTimeout,
-} = {}) {
-  let userSpeaking = false;
-  let pendingTimer = null;
-  let bargeInTriggered = false;
-
-  const clearPendingTimer = () => {
-    if (pendingTimer) {
-      clearTimeoutFn(pendingTimer);
-      pendingTimer = null;
-    }
-  };
-
-  const reset = () => {
-    userSpeaking = false;
-    bargeInTriggered = false;
-    clearPendingTimer();
-  };
-
-  return {
-    isUserSpeaking: () => userSpeaking,
-    handleSpeechStarted: () => {
-      userSpeaking = true;
-      bargeInTriggered = false;
-      clearPendingTimer();
-      pendingTimer = setTimeoutFn(() => {
-        pendingTimer = null;
-        if (!userSpeaking || bargeInTriggered) return;
-        bargeInTriggered = true;
-        onBargeIn?.();
-      }, graceMs);
-    },
-    handleSpeechStopped: () => {
-      userSpeaking = false;
-      clearPendingTimer();
-    },
-    handleResponseCreated: reset,
-    reset,
-  };
-}
-
-const CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL = {
-  type: 'function',
-  name: 'create_taskdeck_caller_intake_task',
-  description:
-    'Create one narrow Flowpath task from an external caller\'s confirmed message. This legacy taskdeck-named tool does not read Flowpath data and must not be used for arbitrary Flowpath writes.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByCaller: {
-        type: 'boolean',
-        description: 'Must be true only after the caller confirms the exact message to save for Tom.',
-      },
-      callerName: {
-        type: 'string',
-        nullable: true,
-        description: 'Caller name, if available.',
-      },
-      contactPhone: {
-        type: 'string',
-        nullable: true,
-        description: 'Best callback phone number, if available.',
-      },
-      contactEmail: {
-        type: 'string',
-        nullable: true,
-        description: 'Best callback email, if available.',
-      },
-      subject: {
-        type: 'string',
-        description: 'Short subject line for the message.',
-      },
-      messageBody: {
-        type: 'string',
-        description: 'Main message content in the caller\'s own intent.',
-      },
-      callbackRequested: {
-        type: 'boolean',
-        description: 'Whether the caller asked Tom to call back.',
-      },
-      priority: {
-        type: 'string',
-        enum: ['low', 'normal', 'high'],
-        description: 'Estimated urgency.',
-      },
-    },
-    required: ['confirmedByCaller', 'subject', 'messageBody', 'callbackRequested', 'priority'],
-    additionalProperties: false,
-  },
-};
-
-const GET_CODEBASE_OVERVIEW_TOOL = {
-  type: 'function',
-  name: 'get_codebase_overview',
-  description:
-    'List safe, non-sensitive files from the currently running voice-ai-system codebase, with git metadata. Only use for recognized self-calls.',
-  parameters: {
-    type: 'object',
-    properties: {
-      maxFiles: {
-        type: 'integer',
-        minimum: 1,
-        maximum: 100,
-        description: 'Maximum number of file entries to return.',
-      },
-    },
-    additionalProperties: false,
-  },
-};
-
-const SEARCH_CODEBASE_TOOL = {
-  type: 'function',
-  name: 'search_codebase',
-  description:
-    'Search safe, non-sensitive text files in the currently running voice-ai-system codebase. Only use for recognized self-calls.',
-  parameters: {
-    type: 'object',
-    properties: {
-      query: {
-        type: 'string',
-        description: 'Case-insensitive text to search for.',
-      },
-      limit: {
-        type: 'integer',
-        minimum: 1,
-        maximum: 20,
-        description: 'Maximum number of matching lines to return.',
-      },
-    },
-    required: ['query'],
-    additionalProperties: false,
-  },
-};
-
-const READ_CODE_SNIPPET_TOOL = {
-  type: 'function',
-  name: 'read_code_snippet',
-  description:
-    'Read a line-numbered snippet from a safe, non-sensitive file in the currently running voice-ai-system codebase. Only use for recognized self-calls.',
-  parameters: {
-    type: 'object',
-    properties: {
-      filePath: {
-        type: 'string',
-        description: 'Relative file path inside the repository, such as src/realtimeHandler.js.',
-      },
-      startLine: {
-        type: 'integer',
-        minimum: 1,
-        description: 'First line to read. Defaults to 1.',
-      },
-      endLine: {
-        type: 'integer',
-        minimum: 1,
-        description: 'Last line to read. The tool caps snippets to keep responses small.',
-      },
-    },
-    required: ['filePath'],
-    additionalProperties: false,
-  },
-};
-
-const GET_TASKDECK_BRIEFING_TOOL = {
-  type: 'function',
-  name: 'get_taskdeck_briefing',
-  description:
-    'Read the recognized self-caller\'s private Flowpath dashboard data: memory/profile, tasks, projects, situations, check-ins, and plans. Only use for recognized self-calls.',
-  parameters: {
-    type: 'object',
-    properties: {
-      topic: {
-        type: 'string',
-        enum: ['everything', 'tasks', 'projects', 'situations', 'today', 'memory'],
-        description: 'Which Flowpath context to retrieve.',
-      },
-      limit: {
-        type: 'integer',
-        minimum: 1,
-        maximum: 25,
-        description: 'Maximum records per section.',
-      },
-      includeCompletedTasks: {
-        type: 'boolean',
-        description: 'Whether to include done/ignored tasks as well as open tasks.',
-      },
-    },
-    required: ['topic'],
-    additionalProperties: false,
-  },
-};
-
-const GET_TASKDECK_RECORD_TOOL = {
-  type: 'function',
-  name: 'get_taskdeck_record',
-  description:
-    'Read one exact Flowpath record by id for the recognized self-caller. Supports tasks, projects, life areas, situations, check-ins, daily plans, and Next Move plans.',
-  parameters: {
-    type: 'object',
-    properties: {
-      recordType: {
-        type: 'string',
-        enum: ['task', 'project', 'life_area', 'situation', 'checkin', 'daily_plan', 'next_move_plan'],
-        description: 'Type of Flowpath record to read.',
-      },
-      id: { type: 'integer', minimum: 1, description: 'Flowpath record id.' },
-    },
-    required: ['recordType', 'id'],
-    additionalProperties: false,
-  },
-};
-
-const CREATE_TASKDECK_TASK_TOOL = {
-  type: 'function',
-  name: 'create_taskdeck_task',
-  description:
-    'Create a task in the recognized self-caller\'s Flowpath database after explicit confirmation of the exact task to add.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: {
-        type: 'boolean',
-        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
-      },
-      title: { type: 'string', description: 'Task title.' },
-      notes: { type: 'string', description: 'Optional task notes.' },
-      status: {
-        type: 'string',
-        enum: ['open', 'in_progress', 'blocked', 'done', 'ignored'],
-        description: 'Task status. Usually open.',
-      },
-      importance: {
-        type: 'integer',
-        minimum: 1,
-        maximum: 5,
-        description: 'Importance from 1 to 5.',
-      },
-      effort: {
-        type: 'integer',
-        minimum: 1,
-        maximum: 5,
-        description: 'Effort from 1 to 5.',
-      },
-      dueDate: {
-        type: 'string',
-        nullable: true,
-        description: 'Optional due date in YYYY-MM-DD format.',
-      },
-      estimatedMinutes: {
-        type: 'integer',
-        nullable: true,
-        minimum: 1,
-        maximum: 480,
-        description: 'Optional estimated minutes.',
-      },
-      projectId: {
-        type: 'integer',
-        nullable: true,
-        description: 'Optional Flowpath project id.',
-      },
-      projectName: {
-        type: 'string',
-        nullable: true,
-        description: 'Optional existing Flowpath project name to attach the task to.',
-      },
-      lifeAreaId: {
-        type: 'integer',
-        nullable: true,
-        description: 'Optional Flowpath life area id.',
-      },
-      lifeAreaName: {
-        type: 'string',
-        nullable: true,
-        description: 'Optional existing Flowpath life area name to attach the task to.',
-      },
-      situationId: {
-        type: 'integer',
-        nullable: true,
-        description: 'Optional existing Flowpath situation id to attach the task to.',
-      },
-      nextMovePlanId: {
-        type: 'integer',
-        nullable: true,
-        description: 'Optional existing Flowpath Next Move plan id this task comes from.',
-      },
-      sourcePlanSection: {
-        type: 'string',
-        nullable: true,
-        description: 'Optional source section from a plan, such as task_candidate or first_30_minutes.',
-      },
-      frictionType: {
-        type: 'string',
-        enum: ['none', 'unclear', 'too_large', 'scary', 'blocked', 'low_energy', 'needs_person', 'not_important', 'admin_drag'],
-        description: 'Optional friction category.',
-      },
-      frictionNote: { type: 'string', description: 'Optional friction note.' },
-    },
-    required: ['confirmedByTom', 'title'],
-    additionalProperties: false,
-  },
-};
-
-const UPDATE_TASKDECK_TASK_TOOL = {
-  type: 'function',
-  name: 'update_taskdeck_task',
-  description:
-    'Update a known Flowpath task after explicit confirmation of the exact change, such as marking a task done.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: {
-        type: 'boolean',
-        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
-      },
-      taskId: { type: 'integer', description: 'Existing Flowpath task id.' },
-      title: { type: 'string', description: 'Optional replacement task title.' },
-      status: {
-        type: 'string',
-        enum: ['open', 'in_progress', 'blocked', 'done', 'ignored'],
-        description: 'Optional replacement task status.',
-      },
-      importance: {
-        type: 'integer',
-        minimum: 1,
-        maximum: 5,
-        description: 'Optional importance from 1 to 5.',
-      },
-      effort: {
-        type: 'integer',
-        minimum: 1,
-        maximum: 5,
-        description: 'Optional effort from 1 to 5.',
-      },
-      dueDate: {
-        type: 'string',
-        nullable: true,
-        description: 'Optional replacement due date in YYYY-MM-DD format, or null to clear.',
-      },
-      notes: { type: 'string', description: 'Optional replacement notes.' },
-      estimatedMinutes: {
-        type: 'integer',
-        nullable: true,
-        minimum: 1,
-        maximum: 480,
-        description: 'Optional estimated minutes, or null to clear.',
-      },
-      frictionType: {
-        type: 'string',
-        enum: ['none', 'unclear', 'too_large', 'scary', 'blocked', 'low_energy', 'needs_person', 'not_important', 'admin_drag'],
-        description: 'Optional friction category.',
-      },
-      frictionNote: { type: 'string', description: 'Optional friction note.' },
-      projectId: {
-        type: 'integer',
-        nullable: true,
-        description: 'Optional existing Flowpath project id, or null to clear.',
-      },
-      projectName: {
-        type: 'string',
-        nullable: true,
-        description: 'Optional existing Flowpath project name.',
-      },
-      lifeAreaId: {
-        type: 'integer',
-        nullable: true,
-        description: 'Optional existing Flowpath life area id, or null to clear.',
-      },
-      lifeAreaName: {
-        type: 'string',
-        nullable: true,
-        description: 'Optional existing Flowpath life area name.',
-      },
-      situationId: {
-        type: 'integer',
-        nullable: true,
-        description: 'Optional existing Flowpath situation id, or null to clear.',
-      },
-      nextMovePlanId: {
-        type: 'integer',
-        nullable: true,
-        description: 'Optional existing Flowpath Next Move plan id, or null to clear.',
-      },
-      sourcePlanSection: {
-        type: 'string',
-        nullable: true,
-        description: 'Optional source section from a plan, or null to clear.',
-      },
-    },
-    required: ['confirmedByTom', 'taskId'],
-    additionalProperties: false,
-  },
-};
-
-const CREATE_TASKDECK_CHECKIN_TOOL = {
-  type: 'function',
-  name: 'create_taskdeck_checkin',
-  description:
-    'Create a daily check-in in the recognized self-caller\'s Flowpath database after explicit confirmation of the captured check-in.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: {
-        type: 'boolean',
-        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
-      },
-      energyLevel: {
-        type: 'integer',
-        minimum: 1,
-        maximum: 10,
-        description: 'Energy level from 1 to 10.',
-      },
-      mood: { type: 'string', description: 'Mood notes.' },
-      sleep: { type: 'string', description: 'Sleep notes.' },
-      healthStatus: { type: 'string', description: 'Health/body status notes.' },
-      mainThing: { type: 'string', description: 'The main thing the recognized self-caller wants to focus on.' },
-      resistance: { type: 'string', description: 'Resistance, avoidance, or friction.' },
-      brainDump: { type: 'string', description: 'Additional thoughts or context.' },
-    },
-    required: ['confirmedByTom', 'energyLevel'],
-    additionalProperties: false,
-  },
-};
-
-const CREATE_TASKDECK_SITUATION_TOOL = {
-  type: 'function',
-  name: 'create_taskdeck_situation',
-  description:
-    'Create a new active Flowpath situation after explicit confirmation of the title and urgency.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: {
-        type: 'boolean',
-        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
-      },
-      title: { type: 'string', description: 'Situation title.' },
-      category: { type: 'string', description: 'Situation category. Defaults to custom.' },
-      urgency: {
-        type: 'string',
-        enum: ['low', 'medium', 'high', 'crisis'],
-        description: 'Situation urgency.',
-      },
-      summary: {
-        type: 'string',
-        description: 'Optional summary so far, stored on the initial intake session.',
-      },
-    },
-    required: ['confirmedByTom', 'title'],
-    additionalProperties: false,
-  },
-};
-
-const UPDATE_TASKDECK_SITUATION_TOOL = {
-  type: 'function',
-  name: 'update_taskdeck_situation',
-  description:
-    'Update an existing Flowpath situation after explicit confirmation. Non-destructive; no deletion.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: {
-        type: 'boolean',
-        description: 'Must be true only after the recognized self-caller explicitly confirms the exact write.',
-      },
-      situationId: { type: 'integer', minimum: 1, description: 'Existing Flowpath situation id.' },
-      title: { type: 'string', description: 'Optional replacement title.' },
-      description: { type: 'string', description: 'Optional replacement description.' },
-      category: { type: 'string', description: 'Optional replacement category.' },
-      urgency: { type: 'string', enum: ['low', 'medium', 'high', 'crisis'], description: 'Optional urgency.' },
-      status: { type: 'string', enum: ['active', 'resolved', 'archived'], description: 'Optional status.' },
-    },
-    required: ['confirmedByTom', 'situationId'],
-    additionalProperties: false,
-  },
-};
-
-const CREATE_TASKDECK_PROJECT_TOOL = {
-  type: 'function',
-  name: 'create_taskdeck_project',
-  description: 'Create a Flowpath project for the recognized self-caller after explicit confirmation.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
-      name: { type: 'string', description: 'Project name.' },
-      lifeAreaId: { type: 'integer', nullable: true, description: 'Optional existing life area id.' },
-      lifeAreaName: { type: 'string', nullable: true, description: 'Optional existing life area name.' },
-      status: { type: 'string', enum: ['active', 'paused', 'someday', 'done'], description: 'Project status.' },
-      description: { type: 'string', description: 'Project description.' },
-      nextMilestone: { type: 'string', description: 'Next milestone.' },
-      currentBottleneck: { type: 'string', description: 'Current bottleneck.' },
-      whyItMatters: { type: 'string', description: 'Why the project matters.' },
-    },
-    required: ['confirmedByTom', 'name'],
-    additionalProperties: false,
-  },
-};
-
-const UPDATE_TASKDECK_PROJECT_TOOL = {
-  type: 'function',
-  name: 'update_taskdeck_project',
-  description: 'Update a Flowpath project for the recognized self-caller after explicit confirmation.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
-      projectId: { type: 'integer', minimum: 1, description: 'Existing project id.' },
-      name: { type: 'string', description: 'Optional replacement project name.' },
-      lifeAreaId: { type: 'integer', nullable: true, description: 'Optional existing life area id, or null to clear.' },
-      lifeAreaName: { type: 'string', nullable: true, description: 'Optional existing life area name.' },
-      status: { type: 'string', enum: ['active', 'paused', 'someday', 'done'], description: 'Optional project status.' },
-      description: { type: 'string', description: 'Optional description.' },
-      nextMilestone: { type: 'string', description: 'Optional next milestone.' },
-      currentBottleneck: { type: 'string', description: 'Optional current bottleneck.' },
-      whyItMatters: { type: 'string', description: 'Optional why-it-matters note.' },
-    },
-    required: ['confirmedByTom', 'projectId'],
-    additionalProperties: false,
-  },
-};
-
-const CREATE_TASKDECK_LIFE_AREA_TOOL = {
-  type: 'function',
-  name: 'create_taskdeck_life_area',
-  description: 'Create a Flowpath life area for the recognized self-caller after explicit confirmation.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
-      name: { type: 'string', description: 'Life area name.' },
-      description: { type: 'string', description: 'Life area description.' },
-      priorityLevel: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Priority level.' },
-      desiredOutcome: { type: 'string', description: 'Desired outcome.' },
-      currentBottleneck: { type: 'string', description: 'Current bottleneck.' },
-    },
-    required: ['confirmedByTom', 'name'],
-    additionalProperties: false,
-  },
-};
-
-const UPDATE_TASKDECK_LIFE_AREA_TOOL = {
-  type: 'function',
-  name: 'update_taskdeck_life_area',
-  description: 'Update a Flowpath life area for the recognized self-caller after explicit confirmation.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
-      lifeAreaId: { type: 'integer', minimum: 1, description: 'Existing life area id.' },
-      name: { type: 'string', description: 'Optional replacement name.' },
-      description: { type: 'string', description: 'Optional description.' },
-      priorityLevel: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Optional priority level.' },
-      desiredOutcome: { type: 'string', description: 'Optional desired outcome.' },
-      currentBottleneck: { type: 'string', description: 'Optional current bottleneck.' },
-    },
-    required: ['confirmedByTom', 'lifeAreaId'],
-    additionalProperties: false,
-  },
-};
-
-const CREATE_TASKDECK_DAILY_PLAN_TOOL = {
-  type: 'function',
-  name: 'create_taskdeck_daily_plan',
-  description:
-    'Create a manually confirmed Flowpath daily plan. This does not trigger Flowpath plan generation.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
-      planDate: { type: 'string', nullable: true, description: 'Optional YYYY-MM-DD plan date. Defaults to today.' },
-      checkInId: { type: 'integer', nullable: true, description: 'Optional existing check-in id.' },
-      todayTheme: { type: 'string', description: 'Theme for today.' },
-      honestRead: { type: 'string', description: 'Honest read of today.' },
-      top3Actions: {
-        type: 'array',
-        maxItems: 3,
-        items: { type: 'object', additionalProperties: true },
-        description: 'Up to three action objects.',
-      },
-      avoidToday: { type: 'string', description: 'What to avoid today.' },
-      optionalIfEnergyIsHigh: { type: 'string', description: 'Optional high-energy action.' },
-      minimumViableDay: { type: 'string', description: 'Minimum viable day.' },
-      eveningReviewPrompt: { type: 'string', description: 'Evening review prompt.' },
-    },
-    required: ['confirmedByTom', 'todayTheme'],
-    additionalProperties: false,
-  },
-};
-
-const CREATE_TASKDECK_TASKS_FROM_NEXT_MOVE_PLAN_TOOL = {
-  type: 'function',
-  name: 'create_taskdeck_tasks_from_next_move_plan',
-  description:
-    'Convert an existing Flowpath Next Move plan into attached tasks after explicit confirmation. Does not generate a new plan.',
-  parameters: {
-    type: 'object',
-    properties: {
-      confirmedByTom: { type: 'boolean', description: 'Must be true only after explicit confirmation.' },
-      nextMovePlanId: { type: 'integer', minimum: 1, description: 'Existing Next Move plan id.' },
-    },
-    required: ['confirmedByTom', 'nextMovePlanId'],
-    additionalProperties: false,
-  },
-};
-
-const SEARCH_WEB_TOOL = {
-  type: 'function',
-  name: 'search_web',
-  description:
-    'Quickly search the public web for the recognized self-caller. Use for current, local, volatile, or source-backed information. Default to low context for voice speed unless Tom asks for a deeper search. Never write Flowpath records from results without separate explicit confirmation.',
-  parameters: {
-    type: 'object',
-    properties: {
-      query: { type: 'string', description: 'Public web search query.' },
-      searchContextSize: {
-        type: 'string',
-        enum: ['low', 'medium', 'high'],
-        description: 'Optional amount of search context. Defaults to configured low for voice speed.',
-      },
-    },
-    required: ['query'],
-    additionalProperties: false,
-  },
-};
-
-const TASKDECK_TOOLS = [
-  GET_TASKDECK_BRIEFING_TOOL,
-  GET_TASKDECK_RECORD_TOOL,
-  CREATE_TASKDECK_TASK_TOOL,
-  UPDATE_TASKDECK_TASK_TOOL,
-  CREATE_TASKDECK_CHECKIN_TOOL,
-  CREATE_TASKDECK_SITUATION_TOOL,
-  UPDATE_TASKDECK_SITUATION_TOOL,
-  CREATE_TASKDECK_PROJECT_TOOL,
-  UPDATE_TASKDECK_PROJECT_TOOL,
-  CREATE_TASKDECK_LIFE_AREA_TOOL,
-  UPDATE_TASKDECK_LIFE_AREA_TOOL,
-  CREATE_TASKDECK_DAILY_PLAN_TOOL,
-  CREATE_TASKDECK_TASKS_FROM_NEXT_MOVE_PLAN_TOOL,
-];
-
-const CODEBASE_TOOLS = [
-  GET_CODEBASE_OVERVIEW_TOOL,
-  SEARCH_CODEBASE_TOOL,
-  READ_CODE_SNIPPET_TOOL,
-];
-
-const EXTERNAL_CALLER_TOOLS = [CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL];
-const OWNER_REALTIME_TOOLS = [CREATE_TASKDECK_CALLER_INTAKE_TASK_TOOL, ...TASKDECK_TOOLS, ...CODEBASE_TOOLS, SEARCH_WEB_TOOL];
-
-export const getRealtimeToolsForCaller = (isSelfCaller = false) =>
-  isSelfCaller ? OWNER_REALTIME_TOOLS : EXTERNAL_CALLER_TOOLS;
-
-const INVALID_PHONE_VALUES = new Set([
-  '',
-  'caller id',
-  'callerid',
-  'unknown',
-  'n/a',
-  'na',
-  'none',
-  'null',
-  'undefined',
-  'caller',
-]);
-
-const normalizeCallerPhone = (value) => {
-  if (value == null) return null;
-  const trimmed = String(value).trim();
-  if (!trimmed) return null;
-  if (INVALID_PHONE_VALUES.has(trimmed.toLowerCase())) return null;
-  return trimmed;
-};
-
-const normalizeEmail = (value) => {
-  if (value == null) return null;
-  const trimmed = String(value).trim();
-  if (!trimmed) return null;
-  if (!trimmed.includes('@')) return null;
-  return trimmed;
-};
-
-const normalizePriority = (value) => {
-  if (value === 'low' || value === 'normal' || value === 'high') {
-    return value;
-  }
-  return 'normal';
-};
-
-const normalizeBoolean = (value, fallback = false) => {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') {
-    const lower = value.toLowerCase();
-    if (lower === 'true' || lower === 'yes') return true;
-    if (lower === 'false' || lower === 'no') return false;
-  }
-  return fallback;
-};
-
-const sanitizeText = (value, maxLength = 500) => {
-  if (value == null) return null;
-  const text = String(value).trim();
-  if (!text) return null;
-  return text.slice(0, maxLength);
-};
-
-const digitsOnly = (value) => String(value || '').replace(/\D/g, '');
-
-const areSamePhone = (a, b) => {
-  const da = digitsOnly(a);
-  const db = digitsOnly(b);
-  if (!da || !db) return false;
-  if (da.length >= 10 && db.length >= 10) {
-    return da.slice(-10) === db.slice(-10);
-  }
-  return da === db;
-};
-
-const buildInstructions = ({ isSelfCaller = false, hasCallerPhone = false } = {}) => {
-  let instructions = BASE_INSTRUCTIONS;
-
-  if (isSelfCaller) {
-    instructions += `\nCALL OPENING OVERRIDE: Caller ID matches Tom's number. Start this call by saying exactly: "${SELF_CALLER_GREETING}"`;
-    instructions +=
-      '\nCALL CONTEXT: Caller ID matches Tom\'s number. Default to self_note mode unless caller explicitly says otherwise.';
-    instructions +=
-      '\nSELF-CALL PRONOUNS: You are speaking directly with Tom. After the opening greeting, address him in second person as "you" and "your"; do not refer to him as "Tom", "Tom\'s", or "he" when you mean the person you are talking to.';
-    instructions +=
-      '\nFLOWPATH ACCESS: Because this is a recognized self-call, you may use Flowpath tools to read the private dashboard and, after explicit confirmation, create or update non-destructive Flowpath records including tasks, projects, life areas, situations, check-ins, daily plans, and converting existing Next Move plans into tasks. You must separately confirm the exact Flowpath write before every write tool call.';
-    instructions +=
-      '\nWEB SEARCH ACCESS: Because this is a recognized self-call, you may use search_web for public, current, local, volatile, or source-backed information. Discuss results conversationally, cite source names when useful, and do not save anything to Flowpath from search results until Tom confirms the exact Flowpath change.';
-    instructions +=
-      '\nCODEBASE ACCESS: Because this is a recognized self-call, you may use read-only codebase tools to inspect the currently running voice-ai-system code when discussing how Victoria works or how to improve the system. Treat the code as deployed filesystem state, mention the git commit when helpful, and never request or reveal secrets, env files, credentials, or service-account material.';
-  } else {
-    instructions += `\nCALL OPENING: Use the public greeting exactly: "${ASSISTANT_GREETING}"`;
-    instructions += '\nCALL CONTEXT: Treat this caller as an external contact unless clarified otherwise.';
-    instructions +=
-      '\nFLOWPATH ACCESS: Do not reveal, summarize, read, or update Tom\'s private Flowpath data for external callers. The only allowed Flowpath action for an external caller is creating a new caller-intake task from that caller\'s own confirmed message using create_taskdeck_caller_intake_task.';
-    instructions +=
-      '\nWEB SEARCH ACCESS: Do not use web search for external callers.';
-    instructions +=
-      '\nCODEBASE ACCESS: Do not reveal, summarize, or inspect Tom\'s private codebase for external callers.';
-  }
-
-  if (hasCallerPhone) {
-    instructions +=
-      '\nPHONE CONTEXT: Caller phone is available from caller ID. Use it as fallback contactPhone if none is provided.';
-  }
-
-  return instructions;
-};
-
-const getOpeningGreeting = (isSelfCaller) => (isSelfCaller ? SELF_CALLER_GREETING : ASSISTANT_GREETING);
-
-export function attachRealtimeServer(server) {
-  const wss = new WebSocketServer({ server, path: '/realtime' });
-
-  wss.on('listening', () => {
-    console.log('Realtime WebSocket server ready at /realtime');
+export function connectToLive({ apiKey } = {}) {
+  if (!apiKey) throw new Error('OpenAI access is not configured.');
+  return new WebSocket(LIVE_ENDPOINT, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    handshakeTimeout: DEFAULT_LIMITS.startTimeoutMs,
+    maxPayload: 2 * 1024 * 1024,
   });
+}
 
-  wss.on('connection', (socket, request) => {
-    const callSid = request.headers['x-twilio-call-sid'] || null;
-    console.log('Twilio stream connected');
-    console.log(`[Realtime] Twilio stream connected${callSid ? ` for CallSid=${callSid}` : ''}`);
+const parseMessage = (data) => JSON.parse(typeof data === 'string' ? data : data.toString());
+const audioBytes = (payload) => {
+  if (typeof payload !== 'string' || !payload.length || payload.length % 4 !== 0
+    || !/^[A-Za-z0-9+/]+={0,2}$/.test(payload)) return null;
+  return Buffer.from(payload, 'base64').length;
+};
 
-    const openaiSocket = connectToOpenAI();
-    if (!openaiSocket) {
-      console.error('[OpenAI] Failed to create OpenAI WebSocket; closing Twilio stream');
-      socket.close();
-      return;
+// The caller and tool permissions come from a single-use, verified call grant.
+// Live owns turn taking: input and output remain independent continuous streams.
+export function attachLiveCall(socket, {
+  security,
+  connectLive,
+  executeTool = executeCodeTool,
+  logger = console,
+  limits: overrides = {},
+  onFinish = () => {},
+} = {}) {
+  const limits = { ...DEFAULT_LIMITS, ...overrides };
+  let live = null;
+  let streamSid = null;
+  let started = false;
+  let startSent = false;
+  let closing = false;
+  let finished = false;
+  let isOwner = false;
+  let closeTimer = null;
+  let callTimer = null;
+  let pendingInput = [];
+  let pendingInputBytes = 0;
+  let queuedAudioBytes = 0;
+  let markSequence = 0;
+  let toolQueue = Promise.resolve();
+  let continuationPending = false;
+  let continuationTimer = null;
+  const marks = new Map();
+  const responses = new Map();
+  const delegationResponses = new Map();
+  const seenCalls = new Set();
+  const abortController = new AbortController();
+  const summary = {
+    sessionId: null,
+    isOwner: false,
+    reason: null,
+    voiceSeconds: 0,
+    usageFinalized: false,
+    customCalls: 0,
+    playedAudioBytes: 0,
+    backend: { responses: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+  };
+
+  const send = (target, event) => {
+    if (!target || target.readyState !== WebSocket.OPEN) return false;
+    try {
+      if (target.bufferedAmount > 256 * 1024) return false;
+      target.send(JSON.stringify(event));
+      return true;
+    } catch {
+      return false;
     }
+  };
+  const command = (event) => send(live, { event_id: randomUUID(), ...event });
+  const closeSocket = (target) => {
+    if (!target || target.readyState === WebSocket.CLOSED) return;
+    try { target.close(); } catch { target.terminate?.(); }
+  };
+  const clearPlayback = () => {
+    if (streamSid) send(socket, { event: 'clear', streamSid });
+    marks.clear();
+    queuedAudioBytes = 0;
+  };
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    closing = true;
+    abortController.abort();
+    clearTimeout(startTimer);
+    clearTimeout(closeTimer);
+    clearTimeout(callTimer);
+    clearTimeout(continuationTimer);
+    for (const batch of responses.values()) clearTimeout(batch.timer);
+    responses.clear();
+    delegationResponses.clear();
+    seenCalls.clear();
+    marks.clear();
+    pendingInput = [];
+    closeSocket(live);
+    closeSocket(socket);
+    logger.info('[Live] call ended', structuredClone(summary));
+    onFinish();
+  };
+  const close = (reason = 'call_ended') => {
+    if (closing || finished) return;
+    closing = true;
+    summary.reason = reason;
+    abortController.abort();
+    clearTimeout(startTimer);
+    clearTimeout(callTimer);
+    clearTimeout(continuationTimer);
+    for (const batch of responses.values()) clearTimeout(batch.timer);
+    pendingInput = [];
+    clearPlayback();
+    closeSocket(socket);
+    closeTimer = setTimeout(() => {
+      live?.terminate?.();
+      finish();
+    }, limits.closeTimeoutMs);
+    closeTimer.unref?.();
+    if (started && command({ type: 'session.close' })) return;
+    // If startup is already in flight, receive session.started and then close it.
+    if (startSent && live?.readyState === WebSocket.OPEN) return;
+    live?.terminate?.();
+    finish();
+  };
+  const startTimer = setTimeout(() => close('startup_timeout'), limits.startTimeoutMs);
+  startTimer.unref?.();
 
-    let streamSid = null;
-    let activeResponse = false;
-    let currentResponseId = null;
-    let userSpeaking = false;
-    let functionCallBuffer = '';
-    let functionCallName = null;
-    let functionCallId = null;
-    let inferredCallerPhone = null;
-    let isSelfCaller = false;
-    let lastCallerIntakeTask = null;
-    let lastTaskDeckAction = null;
-    let lastCodebaseAction = null;
-    let lastWebSearchAction = null;
-    let callStartMs = Date.now();
-    let callEndMs = null;
-    let openaiReady = false;
-    let twilioStartReceived = false;
-    let sessionInitialized = false;
-    let openaiUsageTotals = {
-      input_tokens: 0,
-      input_cached_tokens: 0,
-      input_uncached_tokens: 0,
-      input_audio_tokens: 0,
-      output_tokens: 0,
-      output_audio_tokens: 0,
-      model_requests: 0,
-    };
-
-    const ownerPhone = normalizeCallerPhone(process.env.TWILIO_OWNER_PHONE);
-    if (!ownerPhone) {
-      console.warn('[Realtime] TWILIO_OWNER_PHONE is not set; self-caller detection is disabled until configured');
-    }
-
-    const resetFunctionCallState = () => {
-      functionCallBuffer = '';
-      functionCallName = null;
-      functionCallId = null;
-    };
-
-    const appendFunctionCallChunk = (message) => {
-      functionCallName = message.name || functionCallName;
-      functionCallId = message.call_id || message.id || functionCallId;
-
-      const delta = message.delta?.arguments;
-      if (delta) {
-        functionCallBuffer += delta;
-        return;
-      }
-
-      if (!functionCallBuffer && message.arguments) {
-        functionCallBuffer = message.arguments;
-      }
-    };
-
-    const cancelActiveResponse = () => {
-      if (!activeResponse || !currentResponseId || openaiSocket.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      try {
-        openaiSocket.send(
-          JSON.stringify({
-            type: 'response.cancel',
-            response_id: currentResponseId,
-          })
-        );
-        console.log('[OpenAI] sent response.cancel for active response', currentResponseId);
-      } catch (err) {
-        console.warn('[OpenAI] failed to send response.cancel', err);
-      }
-    };
-
-    const sendClearToTwilio = () => {
-      if (!streamSid || socket.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      try {
-        socket.send(
-          JSON.stringify({
-            event: 'clear',
-            streamSid,
-          })
-        );
-        console.log('[Realtime] sent clear event to Twilio');
-      } catch (err) {
-        console.warn('[Realtime] failed to send clear event to Twilio', err);
-      }
-    };
-
-    const bargeInController = createBargeInController({
-      onBargeIn: () => {
-        userSpeaking = true;
-        sendClearToTwilio();
-        cancelActiveResponse();
-      },
-    });
-
-    const handleSpeechStarted = () => {
-      if (VERBOSE_OPENAI_LOGS) {
-        console.log('[OpenAI] event=input_audio_buffer.speech_started');
-      }
-      userSpeaking = true;
-      bargeInController.handleSpeechStarted();
-    };
-
-    const handleSpeechStopped = () => {
-      if (VERBOSE_OPENAI_LOGS) {
-        console.log('[OpenAI] event=input_audio_buffer.speech_stopped');
-      }
-      userSpeaking = false;
-      bargeInController.handleSpeechStopped();
-    };
-
-    const forwardAudioToTwilio = (audioChunk) => {
-      if (!streamSid || userSpeaking || bargeInController.isUserSpeaking() || !activeResponse) {
-        return;
-      }
-
-      const twilioMedia = {
-        event: 'media',
-        streamSid,
-        media: { payload: audioChunk },
-      };
-
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify(twilioMedia));
-      }
-    };
-
-    const forceResponse = (instructionsText) => {
-      if (openaiSocket.readyState !== WebSocket.OPEN) return;
-      openaiSocket.send(
-        JSON.stringify({
-          type: 'response.create',
-          response: {
-            instructions: instructionsText,
-          },
-        })
-      );
-      activeResponse = true;
-    };
-
-    const maybeInitSession = async () => {
-      if (sessionInitialized || !openaiReady || !twilioStartReceived) return;
-
-      const hasCallerPhone = Boolean(normalizeCallerPhone(inferredCallerPhone));
-      const instructions = buildInstructions({ isSelfCaller, hasCallerPhone });
-
-      if (openaiSocket.readyState !== WebSocket.OPEN) {
-        return;
-      }
-
-      openaiSocket.send(
-        JSON.stringify({
-          type: 'session.update',
-          session: {
-            type: 'realtime',
-            model: DEFAULT_MODEL,
-            instructions,
-            tools: getRealtimeToolsForCaller(isSelfCaller),
-          },
-        })
-      );
-
-      openaiSocket.send(
-        JSON.stringify({
-          type: 'response.create',
-          response: {
-            instructions: `Start the call by saying exactly: ${getOpeningGreeting(isSelfCaller)}`,
-          },
-        })
-      );
-
-      sessionInitialized = true;
-      const phoneLast4 = normalizeCallerPhone(inferredCallerPhone)?.slice(-4) || null;
-      console.log('[Realtime] session initialized', {
-        callSid,
-        hasCallerPhone,
-        callerPhoneLast4: phoneLast4,
-        isSelfCaller,
-      });
-    };
-
-    const sendFunctionOutput = (output, logLabel = 'function_call') => {
-      if (!functionCallId || openaiSocket.readyState !== WebSocket.OPEN) {
-        return;
-      }
-
-      try {
-        openaiSocket.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'function_call_output',
-              call_id: functionCallId,
-              output: JSON.stringify(output),
-            },
-          })
-        );
-      } catch (err) {
-        console.warn(`[${logLabel}] failed to send tool output`, err);
-      }
-    };
-
-    const handleCallerIntakeTask = async (parsedArgs) => {
-      if (isSelfCaller) {
-        sendFunctionOutput(
-          {
-            ok: false,
-            reason: 'use_taskdeck_task_tool',
-            message: 'Self-calls should use the regular Flowpath task tools after explicit confirmation of the exact task.',
-          },
-          'create_taskdeck_caller_intake_task'
-        );
-        forceResponse('For your own notes, I should save this as a regular Flowpath task. Summarize the exact task and ask for confirmation.');
-        return;
-      }
-
-      const confirmedByCaller = normalizeBoolean(parsedArgs?.confirmedByCaller, false);
-      const callerName = sanitizeText(parsedArgs?.callerName, 80);
-      const contactPhone =
-        normalizeCallerPhone(parsedArgs?.contactPhone) || normalizeCallerPhone(inferredCallerPhone) || null;
-      const contactEmail = normalizeEmail(parsedArgs?.contactEmail);
-      const subject = sanitizeText(parsedArgs?.subject, 160) || 'Voice message';
-      const messageBody = sanitizeText(parsedArgs?.messageBody, 2000);
-      const callbackRequested = normalizeBoolean(parsedArgs?.callbackRequested, false);
-      const priority = normalizePriority(parsedArgs?.priority);
-
-      if (!messageBody) {
-        forceResponse('Please restate the message in one or two clear sentences.');
-        return;
-      }
-
-      const payload = {
-        confirmedByCaller,
-        callerName,
-        contactPhone,
-        contactEmail,
-        subject,
-        messageBody,
-        callbackRequested,
-        priority,
-      };
-
-      if (!confirmedByCaller) {
-        sendFunctionOutput(
-          {
-            ok: false,
-            reason: 'confirmation_required',
-          },
-          'create_taskdeck_caller_intake_task'
-        );
-        forceResponse('Summarize the exact message you would add to Tom\'s task list, then ask the caller to confirm.');
-        return;
-      }
-
-      try {
-        const result = await createTaskDeckCallerIntakeTask({
-          ...payload,
-          callSid,
-          callerId: normalizeCallerPhone(inferredCallerPhone),
-          capturedAt: new Date().toISOString(),
-        });
-
-        lastCallerIntakeTask = {
-          ok: Boolean(result?.ok),
-          reason: result?.reason || null,
-          taskId: result?.task?.id || null,
-          subject,
-          at: new Date().toISOString(),
-        };
-
-        sendFunctionOutput(
-          {
-            ok: Boolean(result?.ok),
-            channel: 'taskdeck_task',
-            taskId: result?.task?.id || null,
-            reason: result?.reason || null,
-          },
-          'create_taskdeck_caller_intake_task'
-        );
-
-        if (result?.ok) {
-          forceResponse('Thanks. I added that to Tom\'s task list.');
-        } else {
-          forceResponse('I captured the details, but I could not add them to Flowpath right now.');
+  const updateVoiceUsage = (usage) => {
+    if (Number.isFinite(usage?.seconds) && usage.seconds >= 0) summary.voiceSeconds = usage.seconds;
+  };
+  const addBackendUsage = (usage) => {
+    summary.backend.inputTokens += usage?.input_tokens || 0;
+    summary.backend.outputTokens += usage?.output_tokens || 0;
+    summary.backend.cachedTokens += usage?.input_tokens_details?.cached_tokens || 0;
+  };
+  const processBatch = async (batch) => {
+    if (closing) return;
+    for (const item of batch.calls.values()) {
+      if (closing) return;
+      summary.customCalls += 1;
+      if (summary.customCalls > limits.maxCustomCalls) return close('tool_budget_exceeded');
+      let result;
+      if (!isOwner) {
+        result = { ok: false, reason: 'unauthorized' };
+      } else {
+        let args;
+        try {
+          if (typeof item.arguments !== 'string' || item.arguments.length > 8192) throw new Error();
+          args = JSON.parse(item.arguments);
+          if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error();
+        } catch {
+          result = { ok: false, reason: 'invalid_arguments' };
         }
-      } catch (err) {
-        console.warn('[Flowpath] create_taskdeck_caller_intake_task failed', err);
-        lastCallerIntakeTask = {
-          ok: false,
-          reason: err?.message || 'Caller intake task failed',
-          taskId: null,
-          subject,
-          at: new Date().toISOString(),
-        };
-        sendFunctionOutput(
-          {
-            ok: false,
-            channel: 'taskdeck_task',
-            reason: 'taskdeck_caller_intake_error',
-            message: err?.message || 'Caller intake task failed.',
-          },
-          'create_taskdeck_caller_intake_task'
-        );
-        forceResponse('I captured the details, but I could not add them to Flowpath right now.');
-      }
-    };
-
-    const handleCodebaseTool = async (toolName, parsedArgs) => {
-      if (!isSelfCaller) {
-        sendFunctionOutput(
-          {
-            ok: false,
-            reason: 'not_authorized',
-            message: 'Codebase access is private and only available when Tom is the caller.',
-          },
-          toolName
-        );
-        forceResponse('I can only inspect Tom\'s codebase when I know I am speaking with Tom.');
-        return;
-      }
-
-      try {
-        let result;
-
-        switch (toolName) {
-          case 'get_codebase_overview':
-            result = await getCodebaseOverview(parsedArgs);
-            break;
-          case 'search_codebase':
-            result = await searchCodebase(parsedArgs);
-            break;
-          case 'read_code_snippet':
-            result = await readCodeSnippet(parsedArgs);
-            break;
-          default:
-            result = { ok: false, reason: 'unsupported_codebase_tool' };
-        }
-
-        lastCodebaseAction = {
-          toolName,
-          ok: Boolean(result?.ok),
-          reason: result?.reason || null,
-          commit: result?.git?.shortCommit || null,
-          at: new Date().toISOString(),
-        };
-
-        sendFunctionOutput(result, toolName);
-        forceResponse('Use the codebase tool result to answer directly and concisely in second person. Mention that the view is read-only and currently deployed if that matters.');
-      } catch (err) {
-        console.warn(`[Codebase] ${toolName} failed`, err);
-        lastCodebaseAction = {
-          toolName,
-          ok: false,
-          reason: err?.message || 'Codebase tool failed',
-          at: new Date().toISOString(),
-        };
-        sendFunctionOutput(
-          {
-            ok: false,
-            reason: 'codebase_tool_error',
-            message: err?.message || 'Codebase tool failed.',
-          },
-          toolName
-        );
-        forceResponse('I could not inspect the codebase for that request. Briefly explain what went wrong and suggest a narrower search or file path.');
-      }
-    };
-
-    const handleTaskDeckTool = async (toolName, parsedArgs) => {
-      if (!isSelfCaller) {
-        sendFunctionOutput(
-          {
-            ok: false,
-            reason: 'not_authorized',
-            message: 'Flowpath data is private and only available when Tom is the caller.',
-          },
-          toolName
-        );
-        forceResponse('I can only access Tom\'s private Flowpath dashboard when I know I am speaking with Tom.');
-        return;
-      }
-
-      try {
-        let result;
-
-        switch (toolName) {
-          case 'get_taskdeck_briefing':
-            result = await getTaskDeckBriefing(parsedArgs);
-            break;
-          case 'get_taskdeck_record':
-            result = await getTaskDeckRecord(parsedArgs);
-            break;
-          case 'create_taskdeck_task':
-            result = await createTaskDeckTask(parsedArgs);
-            break;
-          case 'update_taskdeck_task':
-            result = await updateTaskDeckTask(parsedArgs);
-            break;
-          case 'create_taskdeck_checkin':
-            result = await createTaskDeckCheckIn(parsedArgs);
-            break;
-          case 'create_taskdeck_situation':
-            result = await createTaskDeckSituation(parsedArgs);
-            break;
-          case 'update_taskdeck_situation':
-            result = await updateTaskDeckSituation(parsedArgs);
-            break;
-          case 'create_taskdeck_project':
-            result = await createTaskDeckProject(parsedArgs);
-            break;
-          case 'update_taskdeck_project':
-            result = await updateTaskDeckProject(parsedArgs);
-            break;
-          case 'create_taskdeck_life_area':
-            result = await createTaskDeckLifeArea(parsedArgs);
-            break;
-          case 'update_taskdeck_life_area':
-            result = await updateTaskDeckLifeArea(parsedArgs);
-            break;
-          case 'create_taskdeck_daily_plan':
-            result = await createTaskDeckDailyPlan(parsedArgs);
-            break;
-          case 'create_taskdeck_tasks_from_next_move_plan':
-            result = await createTaskDeckTasksFromNextMovePlan(parsedArgs);
-            break;
-          default:
-            result = { ok: false, reason: 'unsupported_taskdeck_tool' };
-        }
-
-        lastTaskDeckAction = {
-          toolName,
-          ok: Boolean(result?.ok),
-          reason: result?.reason || null,
-          at: new Date().toISOString(),
-        };
-
-        sendFunctionOutput(result, toolName);
-
-        if (toolName === 'get_taskdeck_briefing' || toolName === 'get_taskdeck_record') {
-          forceResponse('Use the Flowpath tool result to answer directly and concisely in second person. Mention task or project ids only if they help with a follow-up change.');
-          return;
-        }
-
-        if (result?.ok === false && result?.reason === 'confirmation_required') {
-          forceResponse('Before I change Flowpath, summarize the exact change and ask for confirmation.');
-          return;
-        }
-
-        if (result?.ok) {
-          forceResponse('Briefly confirm the Flowpath change that was completed, using the tool result for exact names or ids.');
-          return;
-        }
-
-        forceResponse('Say the Flowpath change was not completed and briefly explain why.');
-      } catch (err) {
-        console.warn(`[Flowpath] ${toolName} failed`, err);
-        lastTaskDeckAction = {
-          toolName,
-          ok: false,
-          reason: err?.message || 'Flowpath tool failed',
-          at: new Date().toISOString(),
-        };
-        sendFunctionOutput(
-          {
-            ok: false,
-            reason: 'taskdeck_tool_error',
-            message: err?.message || 'Flowpath tool failed.',
-          },
-          toolName
-        );
-        forceResponse('I could not complete that Flowpath request. Briefly explain what went wrong and ask what to do next.');
-      }
-    };
-
-    const handleWebSearchTool = async (parsedArgs) => {
-      if (!isSelfCaller) {
-        sendFunctionOutput(
-          {
-            ok: false,
-            reason: 'not_authorized',
-            message: 'Web search is only available when Tom is the caller.',
-          },
-          'search_web'
-        );
-        forceResponse('I can only use web search when I know I am speaking with Tom.');
-        return;
-      }
-
-      try {
-        const result = await searchWeb(parsedArgs);
-        lastWebSearchAction = {
-          ok: Boolean(result?.ok),
-          query: result?.query || null,
-          sourceCount: Array.isArray(result?.sources) ? result.sources.length : 0,
-          at: result?.searchedAt || new Date().toISOString(),
-        };
-        sendFunctionOutput(result, 'search_web');
-        forceResponse('Use the web search result to answer directly. Mention source names when useful. Do not create or update Flowpath from these results unless Tom separately confirms the exact change.');
-      } catch (err) {
-        console.warn('[WebSearch] search_web failed', err);
-        lastWebSearchAction = {
-          ok: false,
-          query: sanitizeText(parsedArgs?.query, 500),
-          reason: err?.message || 'Web search failed',
-          at: new Date().toISOString(),
-        };
-        sendFunctionOutput(
-          {
-            ok: false,
-            reason: 'web_search_error',
-            message: err?.message || 'Web search failed.',
-          },
-          'search_web'
-        );
-        forceResponse('I could not complete that web search. Briefly explain what went wrong and ask what to do next.');
-      }
-    };
-
-    const handleFunctionCallDone = async () => {
-      if (!functionCallName || !functionCallBuffer) {
-        resetFunctionCallState();
-        return;
-      }
-
-      try {
-        const parsedArgs = JSON.parse(functionCallBuffer);
-
-        if (functionCallName === 'create_taskdeck_caller_intake_task') {
-          await handleCallerIntakeTask(parsedArgs);
-          resetFunctionCallState();
-          return;
-        }
-
-        if (TASKDECK_TOOLS.some((tool) => tool.name === functionCallName)) {
-          await handleTaskDeckTool(functionCallName, parsedArgs);
-          resetFunctionCallState();
-          return;
-        }
-
-        if (CODEBASE_TOOLS.some((tool) => tool.name === functionCallName)) {
-          await handleCodebaseTool(functionCallName, parsedArgs);
-          resetFunctionCallState();
-          return;
-        }
-
-        if (functionCallName === 'search_web') {
-          await handleWebSearchTool(parsedArgs);
-          resetFunctionCallState();
-          return;
-        }
-
-        if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
-          openaiSocket.send(
-            JSON.stringify({
-              type: 'conversation.item.create',
-              item: {
-                type: 'function_call_output',
-                call_id: functionCallId,
-                output: JSON.stringify({ ok: false, reason: 'Unsupported tool name' }),
-              },
-            })
-          );
-        }
-      } catch (err) {
-        console.warn('[Function Call] failed to process arguments', err);
-        forceResponse('Sorry, I missed that. Please repeat your message in one short summary.');
-      }
-
-      resetFunctionCallState();
-    };
-
-    openaiSocket.on('open', () => {
-      openaiReady = true;
-      maybeInitSession();
-      setTimeout(() => {
-        if (!twilioStartReceived) {
-          twilioStartReceived = true;
-          maybeInitSession();
-        }
-      }, 1500);
-    });
-
-    const handleTwilioMessage = (data, isBinary) => {
-      try {
-        const message = JSON.parse(isBinary ? data.toString() : data.toString());
-        const event = message.event || 'unknown';
-
-        switch (event) {
-          case 'media':
-            if (message.media?.payload && openaiSocket.readyState === WebSocket.OPEN) {
-              openaiSocket.send(
-                JSON.stringify({
-                  type: 'input_audio_buffer.append',
-                  audio: message.media.payload,
-                })
-              );
-            }
-            break;
-          case 'start':
-            if (VERBOSE_OPENAI_LOGS) {
-              const sid = message.start?.callSid || callSid || 'unknown';
-              console.log(`[Realtime] event=start callSid=${sid}`);
-            }
-            streamSid = message.start?.streamSid || streamSid;
-            if (message.start?.customParameters?.customerPhone) {
-              inferredCallerPhone = normalizeCallerPhone(message.start.customParameters.customerPhone);
-            }
-            if (ownerPhone && inferredCallerPhone) {
-              isSelfCaller = areSamePhone(inferredCallerPhone, ownerPhone);
-            }
-            if (inferredCallerPhone) {
-              console.log('[Realtime] inferred caller phone', inferredCallerPhone);
-            }
-            twilioStartReceived = true;
-            maybeInitSession();
-            break;
-          case 'mark':
-            if (VERBOSE_OPENAI_LOGS) {
-              const name = message.mark?.name || 'unknown';
-              console.log(`[Realtime] event=mark name=${name}`);
-            }
-            break;
-          case 'stop':
-            if (VERBOSE_OPENAI_LOGS) {
-              const sid = callSid || 'unknown';
-              console.log(`[Realtime] event=stop callSid=${sid}`);
-            }
-            break;
-          default:
-            if (VERBOSE_OPENAI_LOGS) {
-              console.log(`[Realtime] event=${event}`);
-            }
-        }
-      } catch (err) {
-        console.warn('[Realtime] Failed to parse Twilio message as JSON', err?.message || err);
-      }
-    };
-
-    socket.on('message', handleTwilioMessage);
-
-    const handleOpenAiMessage = async (data) => {
-      try {
-        const message = JSON.parse(data.toString());
-        const type = message.type;
-
-        switch (type) {
-          case 'input_audio_buffer.speech_started':
-            handleSpeechStarted();
-            return;
-          case 'input_audio_buffer.speech_stopped':
-            handleSpeechStopped();
-            return;
-          case 'conversation.item.input_audio_transcription.completed': {
-            const transcript =
-              message.transcript ||
-              message.transcription?.text ||
-              message.transcription ||
-              message.item?.transcript ||
-              message.item?.transcription;
-            if (transcript && VERBOSE_OPENAI_LOGS) {
-              console.log('[ASR]', { chars: String(transcript).length, text: transcript });
-            }
-            break;
+        if (!result) {
+          const toolAbort = new AbortController();
+          const signal = AbortSignal.any([abortController.signal, toolAbort.signal]);
+          let timeout;
+          const cancellation = new Promise((resolve) => {
+            signal.addEventListener('abort', () => resolve({ ok: false, reason: 'cancelled' }), { once: true });
+          });
+          try {
+            result = await Promise.race([
+              Promise.resolve().then(() => executeTool(item.name, args, { isOwner, signal })),
+              new Promise((resolve) => {
+                timeout = setTimeout(() => {
+                  resolve({ ok: false, reason: 'tool_timeout' });
+                  toolAbort.abort();
+                }, limits.toolTimeoutMs);
+              }),
+              cancellation,
+            ]);
+          } catch {
+            result = { ok: false, reason: 'tool_failed' };
+          } finally {
+            clearTimeout(timeout);
+            toolAbort.abort();
           }
-          case 'response.created':
-            currentResponseId = message.response?.id || currentResponseId;
-            activeResponse = true;
-            userSpeaking = false;
-            bargeInController.handleResponseCreated();
-            if (VERBOSE_OPENAI_LOGS) {
-              console.log('[OpenAI] event=response.created id=', currentResponseId);
-            }
-            break;
-          case 'session.created':
-          case 'session.updated':
-            if (message.session && VERBOSE_OPENAI_LOGS) {
-              console.log('[OpenAI] session state:', JSON.stringify(message.session, null, 2));
-            }
-            break;
-          case 'response.function_call_arguments.delta':
-            appendFunctionCallChunk(message);
-            break;
-          case 'response.function_call_arguments.done':
-            appendFunctionCallChunk(message);
-            await handleFunctionCallDone();
-            break;
-          case 'response.output_audio.delta': {
-            const audioChunk =
-              typeof message.delta === 'string' ? message.delta : message.delta && message.delta.audio;
-            if (audioChunk) {
-              forwardAudioToTwilio(audioChunk);
-            }
-            break;
-          }
-          case 'response.output_audio.done':
-          case 'response.done':
-          case 'response.cancelled':
-            activeResponse = false;
-            userSpeaking = false;
-            bargeInController.reset();
-            if (VERBOSE_OPENAI_LOGS) {
-              console.log('[OpenAI] event=response.end type=', type);
-            }
-            break;
-          case 'error':
-            if (message.error && message.error.code === 'response_cancel_not_active') {
-              if (VERBOSE_OPENAI_LOGS) {
-                console.log('[OpenAI] cancel_not_active (safe to ignore)');
-              }
-            } else {
-              console.error('[OpenAI] error event payload:', JSON.stringify(message, null, 2));
-            }
-            break;
-          default:
-            if (VERBOSE_OPENAI_LOGS) {
-              console.log(`[OpenAI] event=${type}`);
-            }
         }
-
-        const usage = message.response?.usage || message.usage;
-        if (usage && typeof usage === 'object') {
-          openaiUsageTotals.input_tokens += usage.input_tokens || 0;
-          openaiUsageTotals.output_tokens += usage.output_tokens || 0;
-          openaiUsageTotals.input_audio_tokens += usage.input_audio_tokens || 0;
-          openaiUsageTotals.output_audio_tokens += usage.output_audio_tokens || 0;
-
-          if (usage.input_cached_tokens != null) {
-            openaiUsageTotals.input_cached_tokens += usage.input_cached_tokens;
-          }
-          if (usage.input_uncached_tokens != null) {
-            openaiUsageTotals.input_uncached_tokens += usage.input_uncached_tokens;
-          }
-
-          openaiUsageTotals.model_requests += 1;
+      }
+      if (closing) return;
+      let output;
+      try {
+        output = JSON.stringify(result ?? { ok: false, reason: 'empty_result' });
+        if (output.length > 32_000) {
+          output = JSON.stringify({ ok: false, reason: 'result_too_large', message: 'Narrow the source search or requested line range.' });
         }
       } catch {
-        console.warn('[OpenAI] Failed to parse message as JSON');
+        output = JSON.stringify({ ok: false, reason: 'invalid_tool_result' });
       }
-    };
-
-    openaiSocket.on('message', handleOpenAiMessage);
-
-    socket.on('close', (code, reason) => {
-      callEndMs = Date.now();
-      bargeInController.reset();
-      const callDurationSeconds = Math.round((callEndMs - callStartMs) / 1000);
-      const reasonText = normalizeReason(reason);
-      const callerPhone = normalizeCallerPhone(inferredCallerPhone);
-
-      console.log('Twilio stream closed');
-      console.log(
-        `[Realtime] Twilio stream closed${callSid ? ` (CallSid=${callSid})` : ''}: code=${code} reason=${reasonText}`
-      );
-
-      console.log('[Call Summary]', {
-        callSid,
-        callerPhone,
-        isSelfCaller,
-        callerIntakeTask: lastCallerIntakeTask,
-        lastTaskDeckAction,
-        lastCodebaseAction,
-        lastWebSearchAction,
-        callDurationSeconds,
-        openaiUsageTotals,
-      });
-
-      if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
-        openaiSocket.close();
-      }
-    });
-
-    socket.on('error', (error) => {
-      console.error(`[Realtime] Twilio stream error${callSid ? ` (CallSid=${callSid})` : ''}:`, error);
-    });
-  });
-}
-
-export function connectToOpenAI() {
-  const apiKey = process.env.OPENAI_API_KEY;
-
-  if (!apiKey) {
-    console.warn('[OpenAI] OPENAI_API_KEY missing; cannot connect to Realtime API.');
-    return null;
-  }
-
-  console.log('[OpenAI] connecting');
-
-  const ws = new WebSocket(DEFAULT_REALTIME_ENDPOINT, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-  });
-
-  ws.on('open', () => {
-    console.log('[OpenAI] connected');
-
-    const fallbackInstructions = buildInstructions({
-      isSelfCaller: false,
-      hasCallerPhone: false,
-    });
-
-    const sessionUpdate = {
-      type: 'session.update',
-      session: {
-        type: 'realtime',
-        model: DEFAULT_MODEL,
-        output_modalities: ['audio'],
-        instructions: fallbackInstructions,
-        audio: {
-          input: {
-            format: { type: 'audio/pcmu' },
-            transcription: {
-              model: 'gpt-4o-transcribe',
-            },
-            turn_detection: {
-              type: 'server_vad',
-              threshold: 0.65,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 650,
-              create_response: true,
-              interrupt_response: false,
-            },
-          },
-          output: {
-            format: { type: 'audio/pcmu' },
-            voice: 'marin',
-          },
-        },
-        tools: EXTERNAL_CALLER_TOOLS,
-      },
-    };
-
-    ws.send(JSON.stringify(sessionUpdate));
-  });
-
-  ws.on('close', () => {
-    if (VERBOSE_OPENAI_LOGS) {
-      console.log('[OpenAI] closed');
+      if (!command({
+        type: 'response.item.create',
+        item: { type: 'function_call_output', call_id: item.call_id, output },
+      })) return close('tool_result_delivery_failed');
     }
-  });
+    batch.resultsSent = true;
+  };
+  const maybeContinue = () => {
+    if (closing || continuationPending) return;
+    const batches = [...responses.values()];
+    // response.create is session-scoped. Results for all known pending calls
+    // must be submitted before asking Live to resume its managed backend.
+    if (batches.some((batch) => !batch.completed || (batch.calls.size && !batch.resultsSent))) return;
+    const ready = batches.filter((batch) => batch.calls.size && batch.resultsSent && !batch.continued);
+    if (!ready.length) return;
+    for (const batch of ready) batch.continued = true;
+    continuationPending = true;
+    continuationTimer = setTimeout(() => close('backend_timeout'), limits.backendTimeoutMs);
+    continuationTimer.unref?.();
+    if (!command({ type: 'response.create' })) close('continuation_failed');
+  };
+  const handleBackend = (envelope) => {
+    if (closing) return;
+    const event = envelope.event;
+    if (!event || typeof event.type !== 'string') return;
+    if (event.type === 'response.created') {
+      const id = event.response?.id;
+      if (!id || responses.has(id)) return;
+      continuationPending = false;
+      clearTimeout(continuationTimer);
+      summary.backend.responses += 1;
+      if (summary.backend.responses > limits.maxBackendResponses) return close('backend_budget_exceeded');
+      const batch = { id, calls: new Map(), completed: false, resultsSent: false, continued: false, timer: null };
+      batch.timer = setTimeout(() => close('backend_timeout'), limits.backendTimeoutMs);
+      batch.timer.unref?.();
+      responses.set(id, batch);
+      if (envelope.delegation_id) delegationResponses.set(envelope.delegation_id, id);
+      return;
+    }
+    const id = event.response_id || event.response?.id || delegationResponses.get(envelope.delegation_id);
+    const batch = responses.get(id);
+    if (!batch) return;
+    if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') {
+      const item = event.item;
+      if (batch.completed || !item.call_id || seenCalls.has(item.call_id)) return;
+      if (seenCalls.size >= limits.maxCustomCalls) return close('tool_budget_exceeded');
+      seenCalls.add(item.call_id);
+      batch.calls.set(item.call_id, { call_id: item.call_id, name: item.name, arguments: item.arguments });
+    } else if (['response.completed', 'response.failed', 'response.incomplete', 'response.cancelled'].includes(event.type)) {
+      if (batch.completed) return;
+      batch.completed = true;
+      clearTimeout(batch.timer);
+      addBackendUsage(event.response?.usage);
+      if (event.type !== 'response.completed') {
+        batch.calls.clear();
+        batch.resultsSent = true;
+        batch.continued = true;
+        logger.warn('[Live] delegated response did not complete');
+        command({ type: 'session.instructions.append', delegation_id: null,
+          content: 'The backend request failed. Explain that briefly. Do not claim a successful lookup or retry automatically.' });
+        maybeContinue();
+        return;
+      }
+      toolQueue = toolQueue.then(async () => {
+        await processBatch(batch);
+        maybeContinue();
+      }).catch(() => close('tool_processing_failed'));
+    }
+  };
+  const handleLiveMessage = (data) => {
+    try {
+      const event = parseMessage(data);
+      if (event.type === 'session.closed') {
+        updateVoiceUsage(event.usage);
+        summary.usageFinalized = true;
+        summary.reason ||= event.reason || 'session_closed';
+        return finish();
+      }
+      if (event.type === 'session.started') {
+        if (started) return;
+        started = true;
+        summary.sessionId = event.session?.id || null;
+        if (closing) return command({ type: 'session.close' });
+        clearTimeout(startTimer);
+        callTimer = setTimeout(() => close('call_duration_limit'), limits.maxCallMs);
+        callTimer.unref?.();
+        for (const audio of pendingInput) {
+          if (!send(live, { type: 'session.input_audio.append', audio })) return close('input_delivery_failed');
+        }
+        pendingInput = [];
+        pendingInputBytes = 0;
+      } else if (event.type === 'session.usage.updated') {
+        updateVoiceUsage(event.usage);
+      } else if (!closing && event.type === 'session.output_audio.delta') {
+        const bytes = audioBytes(event.delta);
+        if (!started || !streamSid || bytes == null) return close('invalid_output_audio');
+        if (queuedAudioBytes + bytes > limits.maxQueuedAudioMs * 8) return close('playback_backlog');
+        const name = `live-${++markSequence}`;
+        if (!send(socket, { event: 'media', streamSid, media: { payload: event.delta } })) return close('output_delivery_failed');
+        marks.set(name, bytes);
+        queuedAudioBytes += bytes;
+        if (!send(socket, { event: 'mark', streamSid, mark: { name } })) close('playback_tracking_failed');
+      } else if (!closing && event.type === 'response.event') {
+        handleBackend(event);
+      } else if (event.type === 'error') {
+        // Do not log provider payloads: errors can echo instructions or tool data.
+        logger.warn('[Live] provider rejected a command');
+        close('provider_error');
+      }
+    } catch {
+      close('invalid_provider_event');
+    }
+  };
+  const handleTwilioMessage = (data) => {
+    if (closing) return;
+    try {
+      const event = parseMessage(data);
+      if (event.event === 'start') {
+        if (streamSid) return close('duplicate_stream_start');
+        const format = event.start?.mediaFormat;
+        if (format?.encoding !== 'audio/x-mulaw' || format.sampleRate !== 8000 || format.channels !== 1) {
+          return close('unsupported_phone_audio');
+        }
+        const grant = security?.consumeGrant({
+          token: event.start?.customParameters?.grantToken,
+          callSid: event.start?.callSid,
+        });
+        if (!grant || !event.start.streamSid) return close('unauthorized_stream');
+        streamSid = event.start.streamSid;
+        isOwner = grant.isOwner === true;
+        summary.isOwner = isOwner;
+        // Untrusted custom caller numbers and caller-provided roles are ignored.
+        live = connectLive({ isOwner });
+        live.on('message', handleLiveMessage);
+        live.on('error', () => close('provider_connection_failed'));
+        live.on('close', () => {
+          if (!finished) {
+            summary.reason ||= 'provider_connection_closed';
+            clearPlayback();
+            finish();
+          }
+        });
+        live.on('open', () => {
+          if (closing) return closeSocket(live);
+          const session = buildLiveSession({ isOwner });
+          session.input = [{ type: 'message', role: 'developer', content: [{ type: 'input_text',
+            text: `Speak English. Greet the caller first with exactly: ${isOwner ? OWNER_GREETING : PUBLIC_GREETING} Then listen.` }] }];
+          startSent = command({ type: 'session.start', session });
+          if (!startSent) close('session_start_failed');
+        });
+      } else if (event.event === 'media') {
+        if (!streamSid || !live || (event.streamSid && event.streamSid !== streamSid)) return close('invalid_stream_media');
+        const payload = event.media?.payload;
+        const bytes = audioBytes(payload);
+        if (bytes == null || bytes > 8000) return close('invalid_input_audio');
+        if (event.media.track && event.media.track !== 'inbound') return;
+        if (!started) {
+          pendingInputBytes += bytes;
+          if (pendingInputBytes > limits.maxPendingInputBytes) return close('startup_audio_overflow');
+          pendingInput.push(payload);
+        } else if (!send(live, { type: 'session.input_audio.append', audio: payload })) close('input_delivery_failed');
+      } else if (event.event === 'mark') {
+        if (!marks.has(event.mark?.name)) return;
+        for (const [name, bytes] of marks) {
+          marks.delete(name);
+          queuedAudioBytes -= bytes;
+          summary.playedAudioBytes += bytes;
+          if (name === event.mark.name) break;
+        }
+      } else if (event.event === 'stop') {
+        close('caller_stopped');
+      }
+    } catch {
+      close('invalid_call_event');
+    }
+  };
 
-  ws.on('error', (error) => {
-    console.error('[OpenAI] error', error);
-  });
-
-  return ws;
+  socket.on('message', handleTwilioMessage);
+  socket.on('close', () => close('caller_disconnected'));
+  socket.on('error', () => close('call_connection_failed'));
+  return { close, getSummary: () => structuredClone(summary) };
 }
 
-function normalizeReason(reason) {
-  if (!reason) {
-    return 'none';
-  }
-  if (typeof reason === 'string') {
-    return reason || 'none';
-  }
-  if (reason instanceof Buffer) {
-    const decoded = reason.toString();
-    return decoded || 'none';
-  }
-  return 'unknown';
+export function attachLiveServer(server, { security, streamUrl, apiKey, connectLive, logger = console, limits } = {}) {
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024, perMessageDeflate: false });
+  const calls = new Set();
+  const path = new URL(streamUrl).pathname;
+  server.on('upgrade', (request, socket, head) => {
+    // Twilio signs the wss:// URL from the TwiML, not its HTTPS equivalent.
+    // Its documented handshake normalization can append a trailing slash.
+    const validSignature = security.validateWebhook({
+      signature: request.headers['x-twilio-signature'],
+      url: streamUrl,
+    }) || (!streamUrl.endsWith('/') && security.validateWebhook({
+      signature: request.headers['x-twilio-signature'],
+      url: `${streamUrl}/`,
+    }));
+    if (request.url !== path || !validSignature) {
+      socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n', () => socket.destroy());
+      return;
+    }
+    wss.handleUpgrade(request, socket, head, (connection) => {
+      wss.emit('connection', connection);
+    });
+  });
+  wss.on('connection', (socket) => {
+    const call = attachLiveCall(socket, {
+      security,
+      connectLive: connectLive || (() => connectToLive({ apiKey })),
+      logger,
+      limits,
+      onFinish: () => calls.delete(call),
+    });
+    calls.add(call);
+  });
+  // Start draining before HTTP waits for upgraded connections to close.
+  const closeHttpServer = server.close.bind(server);
+  server.close = (...args) => {
+    for (const call of calls) call.close('server_shutdown');
+    return closeHttpServer(...args);
+  };
+  server.on('close', () => {
+    wss.close();
+  });
+  return wss;
 }

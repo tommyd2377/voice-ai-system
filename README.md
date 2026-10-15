@@ -1,220 +1,161 @@
-# Voice AI System
+# Victoria Voice Assistant
 
-A Node.js voice assistant backend that connects live Twilio phone calls to the OpenAI Realtime API, runs a persona-driven assistant (Victoria), captures confirmed caller messages as Flowpath tasks, and can act as a voice interface for Tom's private Flowpath database.
+Victoria answers phone calls through Twilio and GPT-Live. Public callers can talk
+about Tom's professional and creative background. Verified owner calls also have
+public web search and read-only inspection of this service's current source code.
+There is no database integration, message saving, task management, persistent
+conversation memory, calendar, email, SMS, or outbound action tool.
 
-## System Purpose
-
-This system is built for three primary call flows:
-- External callers can ask about Tom's background, work, and technical skills, then leave a structured message.
-- Tom can call his own number to leave himself a quick voice note.
-- Tom can ask Victoria about Flowpath tasks, projects, situations, check-ins, plans, and create/update selected Flowpath records by voice.
-
-When an external caller confirms a message, Victoria calls a narrow legacy-named tool (`create_taskdeck_caller_intake_task`) that creates a new open Flowpath task from that caller's own message.
-
-When Tom is the caller, Victoria can also call scoped Flowpath tools backed by the same libSQL database used by the Flowpath Next.js app. External callers are not allowed to read, search, update, or attach to private Flowpath data.
-
-## Languages and Core Technologies
-
-### Languages
-- JavaScript (Node.js, ES modules)
-- XML (TwiML generated at runtime for Twilio)
-
-### Runtime and Server
-- Node.js 18+
-- Express (`/voice` webhook and `/health`)
-- Native `http` server (hosts both HTTP endpoints and WS server)
-
-### Realtime and Telephony
-- `ws` WebSocket server for Twilio Media Streams
-- Twilio Programmable Voice (`<Connect><Stream>`) for call audio ingress
-
-### AI and Speech
-- OpenAI Realtime API (`gpt-realtime-2`)
-- Realtime server VAD (`server_vad`) for turn detection and interruption behavior
-- OpenAI transcription model (`gpt-4o-transcribe`) for input audio transcription
-
-### Configuration and Developer Tooling
-- `dotenv` for environment variable loading
-- `nodemon` for local autoreload during development
-
-## Current vs Dormant Components
-
-### Actively used in runtime path
-- `src/server.js`
-- `src/realtimeHandler.js`
-- `ws`, `express`, `dotenv`
-- `@libsql/client` for shared Flowpath database access
-
-### Present but currently dormant or unused
-- `src/firebase.js` and `firebase-admin` dependency (not in active call path)
-- `src/twilioWebhook.js` helper and `twilio` package (not wired in `src/server.js`)
-- `@openai/agents` and `@openai/agents-extensions` packages (installed, not referenced by active code)
-
-## Architecture Overview
+## Architecture
 
 ```mermaid
 flowchart LR
-  A[Caller Phone] --> B[Twilio Voice Webhook POST /voice]
-  B --> C[Express server in src/server.js]
-  C --> D[TwiML Connect Stream]
-  D --> E[Twilio Media Stream WebSocket]
-  E --> F[Realtime bridge in src/realtimeHandler.js]
-  F --> G[OpenAI Realtime API gpt-realtime-2]
-  G --> F
-  F --> E
-  F --> J[Flowpath libSQL database]
+  Caller[Phone caller] <--> Twilio[Twilio Media Streams]
+  Twilio <--> Node[Node.js voice bridge]
+  Node <--> Live[GPT-Live 1 / Marin]
+  Live <--> Backend[GPT-6 Luna Responses backend]
+  Backend <--> Search[Hosted web search]
+  Backend <--> Code[Protected read-only code tools via Node]
 ```
 
-## End-to-End Call Flow
+- Voice: `gpt-live-1`, voice `marin`, using the Live primary WebSocket.
+- Backend: `gpt-6-luna` through managed Responses delegation, low reasoning effort,
+  concise output, at most 800 output tokens per backend response.
+- Audio: raw mono G.711 mu-law at 8 kHz (`audio/pcmu`) in both directions. Twilio
+  bytes pass through without conversion.
+- Transport: Express and `ws`. The existing `/realtime` phone-stream path is
+  preserved; it now connects to `/v1/live/sessions`, with no model query string.
+- Storage: `store: false`; no recordings, transcripts, caller messages, or call
+  history are persisted by this application. Operational summaries omit phone
+  numbers, PINs, grants, transcript text, and tool contents.
 
-1. Twilio sends `POST /voice` to the app.
-2. `src/server.js` returns TwiML with `<Connect><Stream ...>` pointing to `/realtime`.
-3. Twilio opens a WebSocket stream and sends media/control events.
-4. `src/realtimeHandler.js` opens a second WebSocket to OpenAI Realtime.
-5. Audio frames are forwarded from Twilio to OpenAI (`input_audio_buffer.append`).
-6. OpenAI returns response audio deltas; bridge forwards them back to Twilio.
-7. On user barge-in, the bridge sends Twilio `clear` and OpenAI `response.cancel`.
-8. When Victoria confirms an external caller message, the model calls `create_taskdeck_caller_intake_task`.
-9. When Tom asks about Flowpath, model calls scoped Flowpath read/write tools.
-10. Bridge validates/normalizes payloads, performs scoped database operations, then returns tool output.
-11. Assistant confirms success/failure to the caller and logs a concise call summary.
+The voice and backend prompts are separate in `src/assistantConfig.js`. The voice
+prompt defines Victoria's personality, greeting, interruption behavior, and when
+to delegate. The backend prompt supplies background facts, permissions, and tool
+rules. Current project status is not invented from an old project list.
 
-## Realtime Session Design
+## Call flow and permissions
 
-`connectToOpenAI()` initializes realtime with:
-- Model: `gpt-realtime-2`
-- Output audio modality with `audio/pcmu`
-- Input transcription: `gpt-4o-transcribe`
-- Turn detection: `server_vad`
+1. Twilio posts a signed form webhook to `/voice`.
+2. The server verifies `X-Twilio-Signature` against the configured public origin.
+3. A matching owner number is offered a DTMF PIN prompt when owner verification is
+   configured. The signed `/voice/owner` callback checks the PIN. A missing or
+   incorrect PIN continues as a public caller; there is no retry loop. A caller
+   claiming to be Tom in conversation cannot change permissions.
+4. The signed webhook issues an in-memory, single-use stream grant bound to the
+   call ID. Grants expire after 60 seconds; at most 1,024 are retained.
+5. The WebSocket upgrade signature and the stream's grant/call ID are checked
+   before any OpenAI connection starts. Custom caller-number or role parameters
+   supplied by a stream are ignored.
+6. The server sends `session.start` and waits for `session.started` before sending
+   caller audio. Startup buffering is bounded to two seconds of phone audio.
+7. Audio flows in both directions continuously. Live owns interruptions and
+   turn-taking; the bridge does not cancel responses or discard output whenever
+   a noise is detected. Twilio playback marks track audio actually played.
+8. Hosted search runs inside the Responses backend. Custom code functions are
+   collected by response and call ID, authorized again in Node, deduplicated,
+   executed sequentially, and returned with `response.item.create` followed by
+   `response.create` only after all known pending calls have their results.
+9. A caller stop, failure, or duration/budget limit stops new work, aborts pending
+   custom tools, and requests `session.close`. The connection stays open for
+   final `session.closed` usage, with a 15-second finalization deadline. There is
+   no automatic reconnect or paid retry. Returning from the stream ends the call.
 
-`attachRealtimeServer()` manages:
-- Twilio stream lifecycle (`start`, `media`, `mark`, `stop`, close/error)
-- OpenAI lifecycle (`session.*`, `response.*`, function call deltas)
-- Function-call assembly for Flowpath caller-intake and private self-call tools
-- App-controlled barge-in debounce before clearing/cancelling assistant audio
-- Usage accounting (`input/output/audio/cached token` aggregates)
+Public sessions receive **no tools**. Verified owner sessions receive:
 
-## Tool Contract: `create_taskdeck_caller_intake_task`
+| Tool | Purpose |
+| --- | --- |
+| `web_search` | OpenAI-hosted public research; speak source names and retain citations in backend results. |
+| `get_codebase_overview` | List approved source files and available Git metadata. |
+| `search_codebase` | Search approved source text. |
+| `read_code_snippet` | Read a line-numbered snippet, capped at 120 lines. |
 
-The assistant uses this external-caller-safe function tool:
-- `confirmedByCaller`: boolean
-- `callerName`: nullable string
-- `contactPhone`: nullable string
-- `contactEmail`: nullable string
-- `subject`: string
-- `messageBody`: string
-- `callbackRequested`: boolean
-- `priority`: `low | normal | high`
+Code inspection uses the running filesystem. A newly deployed version therefore
+exposes its own current source without retraining Victoria. Inspection is limited
+to approved source/test/docs files and selected root metadata. Hidden files,
+credentials, configuration artifacts, lockfiles, large files, and path escapes
+are excluded; obvious embedded credentials are redacted. This is a defensive
+filter, not a guarantee that arbitrary source is safe to publish. The tools cannot
+edit files, execute shell commands, inspect other repositories, or grant access.
 
-Behavior notes:
-- Missing contact phone falls back to caller ID when available.
-- The tool only creates a new open Flowpath task.
-- The tool does not read, search, update, or attach to private Flowpath records.
-- Tool output includes `{ ok, channel: "taskdeck_task", taskId?, reason? }`.
+## Runtime configuration
 
-## Flowpath Tool Contracts
+Node.js 24 is used for development. Configure values yourself in the existing
+local environment or your deployment's secret manager. Never commit credentials.
 
-Victoria can use these tools only for self-calls, determined by caller ID matching `TWILIO_OWNER_PHONE`:
+| Variable | Use |
+| --- | --- |
+| `OPENAI_API_KEY` | Required server-side OpenAI access. Never sent to the caller. |
+| `TWILIO_AUTH_TOKEN` | Required to verify Twilio HTTP and WebSocket signatures. |
+| `TWILIO_STREAM_URL` | Required public `wss://` stream URL, including its existing path. No query string or credentials. Its origin must match the public voice-webhook origin. |
+| `TWILIO_OWNER_PHONE` | Optional owner number; E.164 recommended. Matching alone does not enable private tools. |
+| `TWILIO_OWNER_PIN` | Optional owner verification PIN: 4–12 digits. Required with the matching owner number for owner tools. DTMF is collected by Twilio before the Live session, never sent to OpenAI or application logs. |
+| `PORT` | Optional HTTP listening port; defaults to `8080`. |
 
-- `get_taskdeck_briefing`: read profile/memory, life areas, active projects, tasks, situations, recent check-ins, daily plans, and Next Move plans.
-- `get_taskdeck_record`: read one exact Flowpath record by id.
-- `create_taskdeck_task`: create a task after Tom confirms the exact task, including optional situation and Next Move plan attachment.
-- `update_taskdeck_task`: update a known task after Tom confirms the exact change, including status, friction, estimate, situation, and plan attachment fields.
-- `create_taskdeck_checkin`: create a daily check-in after Tom confirms the captured check-in.
-- `create_taskdeck_situation`: create a new active situation and initial intake session after Tom confirms it.
-- `update_taskdeck_situation`: update an existing situation after Tom confirms the exact change.
-- `create_taskdeck_project` / `update_taskdeck_project`: create or update projects after confirmation.
-- `create_taskdeck_life_area` / `update_taskdeck_life_area`: create or update life areas after confirmation.
-- `create_taskdeck_daily_plan`: create a manually confirmed daily plan without triggering Flowpath plan generation.
-- `create_taskdeck_tasks_from_next_move_plan`: convert an existing Next Move plan's task candidates into attached tasks.
-- `search_web`: owner-only quick web lookup via the OpenAI Responses API `web_search` tool. Search results are conversational context only until Tom separately confirms any Flowpath write.
+Missing required configuration makes `/voice` return 503. `/health` checks the
+HTTP process only; it does not verify OpenAI access or call quality. Without valid
+owner verification configuration, calls continue with public permissions.
+The health response also reports model names, the deployment revision when available,
+and missing required/owner configuration names. It never returns credential values;
+configuration presence does not verify that credentials are valid.
 
-External callers get only `create_taskdeck_caller_intake_task`, which inserts a standalone task from their confirmed message and returns only a minimal result.
+The configured public origin is used for signature checks; caller-controlled
+Host/forwarding headers are not trusted. If the webhook and stream use different
+public origins or a proxy rewrites paths, adjust routing deliberately before
+release. Stream grants are process-local: the webhook and its stream must reach
+the same server instance. Multiple replicas need sticky routing or a shared grant
+store before use.
 
-Victoria does not receive arbitrary SQL access. The voice service is a client of Flowpath's existing database, not the owner of Flowpath's schema or migrations.
+No production configuration, credentials, webhook settings, or deployment are
+changed automatically by this repository migration.
 
-The runtime function names still use `taskdeck_*` for compatibility, but Victoria is instructed to treat and describe them as Flowpath tools.
-
-## Directory Map
-
-- `src/server.js`: Express endpoints, TwiML response, server bootstrap
-- `src/realtimeHandler.js`: Twilio/OpenAI realtime bridge, prompt/instructions, Flowpath caller intake
-- `src/taskdeckData.js`: scoped Flowpath database adapter for read/write voice tools
-- `src/twilioWebhook.js`: Alternate Twilio webhook helper (currently not wired)
-- `src/firebase.js`: Dormant Firebase admin initialization (not used in active flow)
-- `.env.example`: runtime configuration template
-
-## Environment Variables
-
-### Required for core call + AI flow
-- `OPENAI_API_KEY`
-- `TWILIO_STREAM_URL`
-
-### Required for Tom/self-caller private Flowpath access
-- `TWILIO_OWNER_PHONE`
-
-### Required for deployed Flowpath voice access
-- `FLOWPATH_DATABASE_URL` (same libSQL/Turso database used by Flowpath)
-- `FLOWPATH_DATABASE_AUTH_TOKEN` if the shared database requires auth
-- `FLOWPATH_OWNER_LOCAL_USER_ID` (defaults to `1`; Victoria only reads/writes this Flowpath user)
-
-For local development, the voice service auto-detects the sibling Flowpath database at `../flowpath/data/flowpath.db` when present. You can also set:
+## Local development and verification
 
 ```bash
-FLOWPATH_DATABASE_URL=file:/Users/thomasdevito/Projects/flowpath/data/flowpath.db
-```
-
-Legacy `TASKDECK_*` and `NEEDLE_*` database environment variables and local database paths are still accepted as fallbacks.
-
-### Optional
-- `OPENAI_REALTIME_ENDPOINT` (runtime forces model query param to `gpt-realtime-2`)
-- `OPENAI_WEB_SEARCH_MODEL` (default `gpt-4.1-mini` for faster voice lookups)
-- `OPENAI_WEB_SEARCH_CONTEXT_SIZE` (`low`, `medium`, or `high`; default `low`)
-- `OPENAI_WEB_SEARCH_MAX_TOOL_CALLS` (default `1`; higher values allow deeper but slower searches)
-- `OPENAI_WEB_SEARCH_MAX_OUTPUT_TOKENS` (default `220`)
-- `OPENAI_WEB_SEARCH_REASONING_EFFORT` (`low`, `medium`, `high`, or `xhigh`; default `low` when using GPT-5/o-series search models)
-- `OPENAI_WEB_SEARCH_TIMEOUT_MS` (default `12000`)
-- `PHONE_RELAY_NUMBER`
-- `PORT` (default `8080`)
-- `VERBOSE_OPENAI_LOGS=true` for deeper event logs
-- `APP_TIMEZONE` (default `America/New_York`)
-
-### Dormant
-- `FIREBASE_SERVICE_ACCOUNT_JSON` (not needed in current runtime path)
-
-## Local Development
-
-1. Install dependencies:
-```bash
-npm install
-```
-
-2. Copy environment template and fill values:
-```bash
-cp .env.example .env
-```
-
-3. Run locally:
-```bash
+npm ci
+npm test
 npm run dev
 ```
 
-4. Health check:
-```bash
-curl http://localhost:8080/health
-```
+`npm run dev` starts the actual phone assistant; it is not an offline simulation.
+An authenticated incoming call can incur OpenAI and Twilio charges. Do not trigger
+calls as a test without explicit host/app and call-budget approval.
 
-5. Expose local server (example with ngrok) and configure Twilio Voice webhook to `POST https://<your-domain>/voice`.
+`npm test` uses fake credentials, mocked provider sockets, synthetic source
+fixtures, and loopback-only HTTP/WebSocket tests. It does not load `.env`, contact
+OpenAI/Twilio, or start emulators. Tests cover Live startup/readiness, full-duplex
+media and playback marks, signed ingress, PIN/grant permissions, tool-call
+correlation and duplicate suppression, failure/timeout shutdown, and cumulative
+usage accounting. No separate build or lint scripts are configured.
 
-## Operational Notes
+Default runtime limits are in `src/realtimeHandler.js`: 15-second startup and
+finalization deadlines, 10-second custom-tool and 30-second backend deadlines,
+30-minute calls, 24 backend responses and custom calls per call, and two seconds
+of unacknowledged playback. Exceeding a limit ends the session rather than
+silently dropping speech or retrying. These are application guardrails, not an
+exact monetary spend cap; hosted searches and backend tokens are billed separately.
 
-- External caller messages are persisted as standalone open Flowpath tasks after caller confirmation.
-- If Flowpath database access is unavailable, voice conversation still works but caller-intake task creation fails.
-- Firebase can be reintroduced later through a storage adapter path without changing call transport architecture.
+A real phone call is still needed before release to check audible quality,
+interruptions, greeting timing, search latency, and final call teardown. Offline
+success establishes the bridge logic, not provider availability or listening
+quality.
 
-## Troubleshooting
+## Files
 
-- `TWILIO_STREAM_URL not configured`: set `TWILIO_STREAM_URL` in `.env`.
-- OpenAI connection fails: verify `OPENAI_API_KEY` and network egress.
-- Tom is not recognized as self-caller: verify `TWILIO_OWNER_PHONE` matches the caller ID format.
-- Assistant talks but cannot create caller task: check Flowpath database env vars and logs for `create_taskdeck_caller_intake_task`.
+- `src/server.js`: signed HTTP routes, owner PIN entry, TwiML, executable entry point.
+- `src/callSecurity.js`: signature checks, owner verification, ephemeral stream grants.
+- `src/realtimeHandler.js`: Live/Twilio bridge and session/tool lifecycle.
+- `src/assistantConfig.js`: voice/backend prompts, session configuration, tool contracts.
+- `src/codebaseData.js`: constrained source inspection.
+- `test/`: offline unit and mocked/loopback integration tests.
+
+Historical restaurant/Firebase modules remain outside the active voice path and
+are not imported by the server or its tools.
+
+## Official protocol references
+
+- [Live primary WebSocket](https://developers.openai.com/api/reference/resources/live/primary-websocket)
+- [Responses delegation and tool continuation](https://developers.openai.com/api/docs/guides/live-delegation)
+- [Session lifecycle and usage](https://developers.openai.com/api/docs/guides/live-conversations)
+- [Live prompting](https://developers.openai.com/api/docs/guides/live-prompting)
+- [Twilio request security](https://www.twilio.com/docs/usage/security)

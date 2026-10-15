@@ -16,6 +16,8 @@ const MAX_FILE_BYTES = 200_000;
 const MAX_SNIPPET_LINES = 120;
 const DEFAULT_SNIPPET_LINES = 80;
 const MAX_SEARCH_RESULTS = 20;
+const ROOT_FILES = new Set(['README.md', 'package.json', 'LICENSE.md']);
+const SOURCE_DIRECTORIES = new Set(['src', 'test', 'docs']);
 
 const SKIPPED_DIRECTORIES = new Set([
   '.git',
@@ -61,6 +63,8 @@ const SENSITIVE_PATH_PATTERNS = [
   /(^|\/).*\.pem$/i,
   /(^|\/).*\.p12$/i,
   /(^|\/).*\.key$/i,
+  /(^|\/)(?:config|configs|certs|keys)(\/|$)/i,
+  /(^|\/)(?:firebase|firestore|railway|vercel|netlify|docker-compose|apphosting)(?:[.-]|$)/i,
 ];
 
 const clampInteger = (value, fallback, min, max) => {
@@ -76,14 +80,32 @@ const isSensitivePath = (relativePath) => {
   return SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(normalized));
 };
 
+const isAllowedPath = (relativePath) => {
+  const parts = toPosixPath(relativePath).split('/');
+  if (parts.some((part) => part.startsWith('.') || SKIPPED_DIRECTORIES.has(part))) return false;
+  if (isSensitivePath(relativePath)) return false;
+  return parts.length === 1 ? ROOT_FILES.has(parts[0]) : SOURCE_DIRECTORIES.has(parts[0]);
+};
+
 const isAllowedFile = async (relativePath, absolutePath) => {
+  if (!isAllowedPath(relativePath)) return false;
   if (SKIPPED_FILES.has(path.basename(relativePath))) return false;
   if (isSensitivePath(relativePath)) return false;
   if (!ALLOWED_EXTENSIONS.has(path.extname(relativePath).toLowerCase())) return false;
 
-  const stat = await fs.stat(absolutePath);
+  const stat = await fs.stat(absolutePath).catch(() => null);
+  if (!stat) return false;
   return stat.isFile() && stat.size <= MAX_FILE_BYTES;
 };
+
+const redactCredentials = (contents) => contents
+  .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g,
+    (block) => block.split(/\r?\n/).map(() => '[REDACTED]').join('\n'))
+  .replace(/\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]')
+  .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '[REDACTED]')
+  .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b/g, '[REDACTED]')
+  .replace(/(\b(?:\w*?(?:api_?key|auth_?token|access_?token|client_?secret|password|private_?key|owner_?pin)|secret|token|pin)\b["']?\s*[:=]\s*)(["'`])([^"'`\r\n]+)\2/gi,
+    '$1$2[REDACTED]$2');
 
 const getSafePath = async (filePath) => {
   const requestedPath = String(filePath || '').trim();
@@ -96,8 +118,14 @@ const getSafePath = async (filePath) => {
     throw new Error('filePath must stay inside the repository.');
   }
 
+  if (!isAllowedPath(normalizedPath)) {
+    throw new Error('That file is not available through the read-only codebase tool.');
+  }
+
   const absolutePath = path.resolve(REPO_ROOT, normalizedPath);
-  const realPath = await fs.realpath(absolutePath);
+  const realPath = await fs.realpath(absolutePath).catch(() => {
+    throw new Error('That file is not available through the read-only codebase tool.');
+  });
 
   if (realPath !== REPO_ROOT_REALPATH && !realPath.startsWith(`${REPO_ROOT_REALPATH}${path.sep}`)) {
     throw new Error('filePath must stay inside the repository.');
@@ -113,8 +141,10 @@ const getSafePath = async (filePath) => {
 
 const readSafeTextFile = async (relativePath) => {
   const { absolutePath, relativePath: safeRelativePath } = await getSafePath(relativePath);
-  const contents = await fs.readFile(absolutePath, 'utf8');
-  return { contents, relativePath: safeRelativePath };
+  const contents = await fs.readFile(absolutePath, 'utf8').catch(() => {
+    throw new Error('That file is not available through the read-only codebase tool.');
+  });
+  return { contents: redactCredentials(contents), relativePath: safeRelativePath };
 };
 
 const walkSafeFiles = async (directory = REPO_ROOT, prefix = '') => {
@@ -126,7 +156,7 @@ const walkSafeFiles = async (directory = REPO_ROOT, prefix = '') => {
     const absolutePath = path.join(directory, entry.name);
 
     if (entry.isDirectory()) {
-      if (!SKIPPED_DIRECTORIES.has(entry.name) && !isSensitivePath(relativePath)) {
+      if (isAllowedPath(relativePath) || (!prefix && SOURCE_DIRECTORIES.has(entry.name))) {
         files.push(...(await walkSafeFiles(absolutePath, relativePath)));
       }
       continue;
@@ -203,7 +233,7 @@ export async function getCodebaseOverview(input = {}) {
     fileCount: files.length,
     files: files.slice(0, maxFiles),
     truncated: files.length > maxFiles,
-    note: 'Read-only view of the currently running deployed filesystem. Sensitive files and large generated files are excluded.',
+    note: 'Read-only view of the running filesystem. Files may differ from the Git commit. Sensitive and large generated files are excluded.',
   };
 }
 

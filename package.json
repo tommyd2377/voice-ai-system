@@ -1,7 +1,7 @@
 {
   "name": "voice-ai-system",
   "version": "0.1.0",
-  "description": "Day-1 MVP plumbing for the GoLine voice AI system.",
+  "description": "Victoria's GPT-Live phone assistant with protected web search and code inspection.",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
@@ -13,16 +13,12 @@
     "twilio",
     "websocket",
     "express",
-    "realtime",
-    "voice",
-    "orders"
+    "gpt-live",
+    "voice"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@libsql/client": "^0.17.3",
-    "@openai/agents": "^0.3.2",
-    "@openai/agents-extensions": "^0.3.2",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "firebase-admin": "^13.6.0",
