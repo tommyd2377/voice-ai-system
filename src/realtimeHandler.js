@@ -3,6 +3,15 @@ import { randomUUID } from 'node:crypto';
 import { buildLiveSession, executeCodeTool, OWNER_GREETING, OWNER_PIN_GREETING, PUBLIC_GREETING } from './assistantConfig.js';
 
 const LIVE_ENDPOINT = 'wss://api.openai.com/v1/live/sessions';
+const PROVIDER_ERROR_CODES = new Set([
+  'unknown_parameter', 'missing_required_parameter', 'invalid_type', 'invalid_value',
+  'invalid_request_error', 'immutable_field_update', 'responses_validation_failed',
+  'rate_limit_exceeded', 'insufficient_quota', 'model_not_found', 'server_error',
+]);
+const PROVIDER_ERROR_PARAMS = new Set([
+  'session', 'session.delegation', 'session.delegation.type', 'session.delegation.responses',
+  ...['model', 'instructions', 'tools', 'tool_choice'].map((field) => `session.delegation.responses.${field}`),
+]);
 const DEFAULT_LIMITS = {
   startTimeoutMs: 15_000,
   closeTimeoutMs: 15_000,
@@ -156,7 +165,7 @@ export function attachLiveCall(socket, {
     // Both outcomes replace the pending backend instructions. Tools stay
     // disabled locally until the matching provider acknowledgment.
     if (!send(live, { type: 'session.update', event_id: ownerUpdate.eventId,
-      session: { delegation: { responses: { instructions, tools, tool_choice } } },
+      session: { delegation: { type: 'responses', responses: { instructions, tools, tool_choice } } },
     })) return close('owner_update_failed');
     ownerUpdateTimer = setTimeout(() => close('owner_update_timeout'), limits.ownerUpdateTimeoutMs);
     ownerUpdateTimer.unref?.();
@@ -342,8 +351,14 @@ export function attachLiveCall(socket, {
       } else if (!closing && event.type === 'response.event') {
         handleBackend(event);
       } else if (event.type === 'error') {
-        // Do not log provider payloads: errors can echo instructions or tool data.
-        logger.warn('[Live] provider rejected a command');
+        // Log only known protocol identifiers. Messages and arbitrary strings
+        // can echo caller instructions, credentials, or tool data.
+        const clientEventId = event.error?.client_event_id ?? event.client_event_id;
+        logger.warn('[Live] provider rejected a command', {
+          code: PROVIDER_ERROR_CODES.has(event.error?.code) ? event.error.code : 'unknown',
+          parameter: PROVIDER_ERROR_PARAMS.has(event.error?.param) ? event.error.param : 'unknown',
+          command: ownerUpdate && clientEventId === ownerUpdate.eventId ? 'session.update' : 'unknown',
+        });
         close('provider_error');
       }
     } catch {

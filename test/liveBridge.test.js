@@ -24,6 +24,13 @@ class FakeSocket extends EventEmitter {
   send(payload) {
     assert.equal(this.readyState, 1, 'only send on an open socket');
     const event = JSON.parse(String(payload));
+    // SessionUpdateConfig.delegation is a discriminated union, even when only
+    // responses settings change: https://developers.openai.com/api/reference/typescript/__sdk_schema?declaration=%28resource%29+live+%3E+%28model%29+session_update_config+%3E+%28schema%29&selected=%28resource%29+live
+    if (event.type === 'session.update' && event.session?.delegation
+      && event.session.delegation.type !== 'responses') {
+      this.protocolErrors.push('invalid_delegation_type');
+      throw new Error('session.update delegation requires type responses');
+    }
     if (event.type === 'response.create' && this.pendingCalls.size) {
       this.protocolErrors.push('continuation_before_all_results');
       throw new Error('response.create requires results for every pending call');
@@ -287,6 +294,25 @@ test('the provider fake rejects continuation until all pending function outputs 
   assert.equal(live.events('response.create').length, 1);
 });
 
+test('the provider contract rejects missing or incorrect delegation discriminators on session updates', () => {
+  for (const type of [undefined, 'realtime', null, true]) {
+    const live = new FakeSocket();
+    assert.throws(() => live.send(JSON.stringify({
+      type: 'session.update',
+      session: { delegation: { ...(type === undefined ? {} : { type }), responses: { tools: [] } } },
+    })), /session.update delegation requires type responses/);
+    assert.deepEqual(live.protocolErrors, ['invalid_delegation_type']);
+    assert.equal(live.events('session.update').length, 0);
+  }
+  const live = new FakeSocket();
+  live.send(JSON.stringify({
+    type: 'session.update',
+    session: { delegation: { type: 'responses', responses: { tools: [], tool_choice: 'none' } } },
+  }));
+  assert.deepEqual(live.protocolErrors, []);
+  assert.equal(live.events('session.update').length, 1);
+});
+
 test('all custom results in one response precede its single continuation', async (t) => {
   const h = harness(t);
   await h.ready();
@@ -381,6 +407,7 @@ test('only matching inbound keypad events verify and owner tools wait for the ma
   const update = h.live.events('session.update')[0];
   assert.equal(h.live.events('session.update').length, 1);
   assert.ok(update.event_id);
+  assert.equal(update.session.delegation.type, 'responses');
   assert.deepEqual(update.session.delegation.responses.tools.map((tool) => tool.name || tool.type), [
     'web_search', 'get_codebase_overview', 'search_codebase', 'read_code_snippet',
   ]);
@@ -444,6 +471,7 @@ test('failed, oversized, and skipped PIN entry stays public for the rest of the 
       assert.equal(h.controller.getSummary().isOwner, false);
       assert.equal(h.live.events('session.update').length, 1);
       const update = h.live.events('session.update')[0];
+      assert.equal(update.session.delegation.type, 'responses');
       assert.deepEqual(update.session.delegation.responses.tools, []);
       assert.equal(update.session.delegation.responses.tool_choice, 'none');
       assert.match(update.session.delegation.responses.instructions, /public permissions/);
@@ -482,6 +510,7 @@ test('PIN entry timeout resumes public conversation and cannot be retried', asyn
   assert.deepEqual(h.pinAttempts, []);
   assert.equal(h.live.events('session.update').length, 1);
   const update = h.live.events('session.update')[0];
+  assert.equal(update.session.delegation.type, 'responses');
   assert.deepEqual(update.session.delegation.responses.tools, []);
   assert.equal(update.session.delegation.responses.tool_choice, 'none');
   assert.equal(h.live.events('session.instructions.append').length, 0);
@@ -548,6 +577,71 @@ test('rejected or unacknowledged owner updates close without enabling tools or r
       h.live.receive({ type: 'session.updated', client_event_id: update.event_id });
       assert.equal(h.controller.getSummary().isOwner, false, 'a late acknowledgment cannot reopen a closing call');
       assert.equal(h.live.events('session.instructions.append').length, 0);
+    });
+  }
+});
+
+test('provider diagnostics identify allowed error fields and correlated updates without logging payloads or PINs', async (t) => {
+  const fakeCredential = 'FAKE_CREDENTIAL_FOR_PRIVACY_TEST_ONLY';
+  for (const idLocation of ['nested', 'top', 'unrelated nested takes precedence']) {
+    await t.test(idLocation, async (t) => {
+      const h = harness(t, { ownerVerificationPending: true });
+      await h.ready();
+      h.enterPin();
+      const update = h.live.events('session.update')[0];
+      const nestedId = idLocation === 'nested' ? update.event_id
+        : idLocation === 'unrelated nested takes precedence' ? 'unrelated_update' : undefined;
+      h.live.receive({
+        type: 'error',
+        ...(idLocation !== 'nested' ? { client_event_id: update.event_id } : {}),
+        error: {
+          code: 'missing_required_parameter',
+          param: 'session.delegation.type',
+          ...(nestedId ? { client_event_id: nestedId } : {}),
+          message: `Untrusted payload ${FAKE_OWNER_PIN} ${fakeCredential}`,
+          details: { pin: FAKE_OWNER_PIN, credential: fakeCredential },
+        },
+      });
+      h.live.receive({ type: 'session.closed', usage: { seconds: 1 } });
+      const warnings = h.logs.filter((log) => log.level === 'warn');
+      assert.deepEqual(warnings, [{
+        level: 'warn',
+        args: ['[Live] provider rejected a command', {
+          code: 'missing_required_parameter',
+          parameter: 'session.delegation.type',
+          command: idLocation === 'unrelated nested takes precedence' ? 'unknown' : 'session.update',
+        }],
+      }]);
+      assert.equal(h.controller.getSummary().isOwner, false);
+      assert.equal(h.controller.getSummary().reason, 'provider_error');
+      const serializedLogs = JSON.stringify(h.logs);
+      assert.equal(serializedLogs.includes(FAKE_OWNER_PIN), false);
+      assert.equal(serializedLogs.includes(fakeCredential), false);
+      assert.equal(serializedLogs.includes(update.event_id), false, 'correlation IDs remain out of the log');
+      assert.equal(serializedLogs.includes('Untrusted payload'), false);
+    });
+  }
+});
+
+test('unknown and malformed provider diagnostics are replaced with fixed safe labels', async (t) => {
+  for (const fields of [
+    { code: FAKE_OWNER_PIN, param: 'FAKE_PRIVATE_PARAMETER_FOR_TEST_ONLY' },
+    { code: { private: FAKE_OWNER_PIN }, param: [FAKE_OWNER_PIN] },
+    {},
+  ]) {
+    await t.test(typeof fields.code, async (t) => {
+      const h = harness(t);
+      await h.ready();
+      h.live.receive({
+        type: 'error', client_event_id: 'unrelated_update',
+        error: { ...fields, message: `Never log ${FAKE_OWNER_PIN}` },
+      });
+      const warning = h.logs.find((log) => log.level === 'warn');
+      assert.deepEqual(warning.args, ['[Live] provider rejected a command', {
+        code: 'unknown', parameter: 'unknown', command: 'unknown',
+      }]);
+      assert.equal(JSON.stringify(h.logs).includes(FAKE_OWNER_PIN), false);
+      assert.equal(h.controller.getSummary().reason, 'provider_error');
     });
   }
 });

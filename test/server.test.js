@@ -44,6 +44,13 @@ class FakeLiveSocket extends EventEmitter {
         }
       });
     } else if (command.type === 'session.update') {
+      if (command.session?.delegation?.type !== 'responses') {
+        queueMicrotask(() => this.emit('message', JSON.stringify({
+          type: 'error',
+          error: { code: 'invalid_request_error', param: 'session.delegation.type' },
+        })));
+        return;
+      }
       this.emit('updateRequested', command);
       queueMicrotask(() => {
         if (this.readyState === WebSocket.OPEN) {
@@ -52,6 +59,8 @@ class FakeLiveSocket extends EventEmitter {
           this.emit('updated', acknowledgment);
         }
       });
+    } else if (command.type === 'session.input_audio.append') {
+      this.emit('inputAudio', command);
     }
   }
 
@@ -236,6 +245,40 @@ test('signed owner call enables private tools after keypad verification and the 
   assert.equal(provider.commands.filter((command) => command.type === 'session.start').length, 1);
   assert.equal(provider.commands.filter((command) => command.type === 'session.update').length, 1);
   assert.equal(JSON.stringify({ commands: provider.commands, logs: app.logs }).includes('04231'), false);
+});
+
+test('star skips owner verification and resumes public conversation with unchanged phone audio', async (t) => {
+  const app = await harness(t);
+  const response = await app.post('/voice', { CallSid: callSid, From: ownerPhone });
+  const sessionPromise = started(app.events);
+  const client = await app.startStream(grantFrom(response));
+  await sessionPromise;
+  const provider = app.providers[0];
+  const updateRequested = once(provider, 'updateRequested', { signal: AbortSignal.timeout(1000) });
+  const updated = once(provider, 'updated', { signal: AbortSignal.timeout(1000) });
+  client.socket.send(JSON.stringify({ event: 'dtmf', streamSid, dtmf: { track: 'inbound', digit: '*' } }));
+  const [update] = await updateRequested;
+  assert.equal(update.session.delegation.type, 'responses');
+  assert.deepEqual(update.session.delegation.responses.tools, []);
+  assert.equal(update.session.delegation.responses.tool_choice, 'none');
+  const [acknowledgment] = await updated;
+  assert.equal(acknowledgment.client_event_id, update.event_id);
+  const continuation = provider.commands.find((command) => command.type === 'session.instructions.append');
+  assert.match(continuation.content, /Continue with public caller permissions/);
+
+  const payload = Buffer.from(Array.from({ length: 160 }, (_, index) => index % 128)).toString('base64');
+  assert.notEqual(payload, Buffer.alloc(160, 0xff).toString('base64'));
+  const audioForwarded = once(provider, 'inputAudio', { signal: AbortSignal.timeout(1000) });
+  client.socket.send(JSON.stringify({ event: 'media', streamSid, media: { track: 'inbound', payload } }));
+  const [forwarded] = await audioForwarded;
+  assert.equal(forwarded.audio, payload);
+  assert.equal(app.logs.some(([message]) => message === '[Live] owner access enabled'), false);
+  assert.equal(provider.commands.some((command) => command.type === 'session.close'), false);
+  assert.equal(provider.readyState, WebSocket.OPEN);
+  assert.equal(client.socket.readyState, WebSocket.OPEN);
+  assert.equal(app.providers.length, 1);
+  assert.equal(provider.commands.filter((command) => command.type === 'session.start').length, 1);
+  assert.equal(provider.commands.filter((command) => command.type === 'session.update').length, 1);
 });
 
 test('only a correct PIN and signed owner caller grant private tools', async (t) => {
