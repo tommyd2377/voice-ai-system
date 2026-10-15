@@ -5,6 +5,8 @@ import { attachLiveCall } from '../src/realtimeHandler.js';
 
 const CALL_SID = `CA${'1'.repeat(32)}`;
 const FRAME = Buffer.alloc(160, 0xff).toString('base64');
+const NON_SILENT_FRAME = Buffer.alloc(160, 0x42).toString('base64');
+const FAKE_OWNER_PIN = '764928315607';
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -66,19 +68,31 @@ class FakeSocket extends EventEmitter {
   }
 }
 
-function harness(t, { isOwner = true, grantValid = true, executeTool, limits = {} } = {}) {
+function harness(t, {
+  ownerVerificationPending = false,
+  isOwner = ownerVerificationPending === true ? false : true,
+  grantValid = true,
+  executeTool,
+  limits = {},
+} = {}) {
   const twilio = new FakeSocket();
   const live = new FakeSocket(0);
   const connections = [];
   const grants = [];
   const executions = [];
+  const pinAttempts = [];
+  const logs = [];
   const controller = attachLiveCall(twilio, {
     security: {
       consumeGrant(input) {
         grants.push(input);
         return grantValid && input.token === 'fake-grant' && input.callSid === CALL_SID
-          ? { isOwner, callSid: CALL_SID }
+          ? { isOwner, ownerVerificationPending, callSid: CALL_SID }
           : null;
+      },
+      verifyOwnerPin(pin) {
+        pinAttempts.push(pin);
+        return pin === FAKE_OWNER_PIN;
       },
     },
     connectLive(options) {
@@ -89,7 +103,9 @@ function harness(t, { isOwner = true, grantValid = true, executeTool, limits = {
       executions.push({ name, args, context });
       return executeTool ? executeTool(name, args, context) : { ok: true, source: name };
     },
-    logger: { log() {}, info() {}, warn() {}, error() {} },
+    logger: Object.fromEntries(['log', 'info', 'warn', 'error'].map((level) => [
+      level, (...args) => logs.push({ level, args: structuredClone(args) }),
+    ])),
     limits: { closeTimeoutMs: 20, startTimeoutMs: 500, maxCallMs: 5000, ...limits },
   });
 
@@ -141,8 +157,15 @@ function harness(t, { isOwner = true, grantValid = true, executeTool, limits = {
     type: 'response.completed',
     response: { id: responseId, status: 'completed', output: [], ...(usage ? { usage } : {}) },
   }, delegationId);
+  const dtmf = (digit, { streamSid = 'MZfake', track = 'inbound' } = {}) => twilio.receive({
+    event: 'dtmf', streamSid, dtmf: { track, digit },
+  });
+  const enterPin = (pin = FAKE_OWNER_PIN) => {
+    for (const digit of pin) dtmf(digit);
+    dtmf('#');
+  };
 
-  return { twilio, live, controller, connections, grants, executions, start, ready, backend, created, call, completed };
+  return { twilio, live, controller, connections, grants, executions, pinAttempts, logs, start, ready, backend, created, call, completed, dtmf, enterPin };
 }
 
 test('unverified media streams cannot start a provider session', async (t) => {
@@ -163,7 +186,7 @@ test('phone audio arriving before a verified start closes the stream without a p
   assert.equal(h.twilio.readyState, 3);
 });
 
-test('verified start configures Live once and buffers phone input until session.started', async (t) => {
+test('verified start configures Live once and discards setup audio until session.started', async (t) => {
   const h = harness(t);
   await h.start();
   assert.equal(h.connections.length, 1);
@@ -177,7 +200,10 @@ test('verified start configures Live once and buffers phone input until session.
   assert.equal(h.live.events('session.input_audio.append').length, 0);
   h.live.receive({ type: 'session.started', session: { id: 'sess_fake' } });
   await tick();
-  assert.equal(h.live.events('session.input_audio.append')[0].audio, FRAME);
+  assert.equal(h.live.events('session.input_audio.append').length, 0, 'setup audio is never replayed');
+  h.twilio.receive({ event: 'media', media: { payload: NON_SILENT_FRAME } });
+  assert.equal(h.live.events('session.input_audio.append').length, 1);
+  assert.equal(h.live.events('session.input_audio.append')[0].audio, NON_SILENT_FRAME);
   const input = h.live.events('session.start')[0].session.input;
   assert.equal(input[0].role, 'developer');
   assert.match(input[0].content[0].text, /Greet the caller first/);
@@ -321,6 +347,234 @@ test('public callers cannot execute private functions even if the provider reque
   assert.equal(h.executions.length, 0);
   const output = h.live.events('response.item.create')[0];
   assert.equal(JSON.parse(output.item.output).ok, false);
+});
+
+test('pending owner verification uses Marin to request keypad entry with no private tools', async (t) => {
+  const h = harness(t, { ownerVerificationPending: true });
+  await h.ready();
+  const { session } = h.live.events('session.start')[0];
+  assert.equal(session.audio.output.voice, 'marin');
+  assert.match(session.input[0].content[0].text, /owner PIN on the keypad/);
+  assert.match(session.instructions, /never request, repeat, guess, or accept a spoken PIN/);
+  assert.deepEqual(session.delegation.responses.tools, []);
+  assert.equal(session.delegation.responses.tool_choice, 'none');
+  assert.equal(h.connections[0].isOwner, false);
+  assert.equal(h.controller.getSummary().isOwner, false);
+
+  h.twilio.receive({ event: 'media', streamSid: 'MZfake', media: { track: 'inbound', payload: NON_SILENT_FRAME } });
+  const masked = h.live.events('session.input_audio.append')[0].audio;
+  assert.equal(Buffer.from(masked, 'base64').length, Buffer.from(NON_SILENT_FRAME, 'base64').length);
+  assert.deepEqual(Buffer.from(masked, 'base64'), Buffer.alloc(160, 0xff));
+});
+
+test('only matching inbound keypad events verify and owner tools wait for the matching update acknowledgment', async (t) => {
+  const h = harness(t, { ownerVerificationPending: true });
+  await h.ready();
+  h.dtmf('9', { streamSid: 'MZother' });
+  h.dtmf('#', { streamSid: 'MZother' });
+  h.dtmf('9', { track: 'outbound' });
+  h.dtmf('#', { track: 'outbound' });
+  for (const invalid of ['12', 'x', '', 7, null]) h.dtmf(invalid);
+  assert.deepEqual(h.pinAttempts, []);
+  h.enterPin();
+  assert.deepEqual(h.pinAttempts, [FAKE_OWNER_PIN]);
+  const update = h.live.events('session.update')[0];
+  assert.equal(h.live.events('session.update').length, 1);
+  assert.ok(update.event_id);
+  assert.deepEqual(update.session.delegation.responses.tools.map((tool) => tool.name || tool.type), [
+    'web_search', 'get_codebase_overview', 'search_codebase', 'read_code_snippet',
+  ]);
+  assert.equal(update.session.delegation.responses.tool_choice, 'auto');
+  assert.equal(h.controller.getSummary().isOwner, false, 'server permissions remain public while the update is in flight');
+  h.enterPin();
+  assert.equal(h.pinAttempts.length, 1, 'entry cannot restart while acknowledgment is pending');
+  assert.equal(h.live.events('session.update').length, 1);
+
+  h.created('response_before_owner_ack');
+  h.call('response_before_owner_ack', 'call_before_owner_ack');
+  h.completed('response_before_owner_ack');
+  await tick();
+  assert.equal(h.executions.length, 0);
+  assert.equal(JSON.parse(h.live.events('response.item.create')[0].item.output).reason, 'unauthorized');
+  h.created('response_after_denial');
+  h.completed('response_after_denial');
+
+  h.live.receive({ type: 'session.updated', client_event_id: 'unrelated_update' });
+  h.live.receive({ type: 'session.updated' });
+  assert.equal(h.controller.getSummary().isOwner, false);
+  assert.equal(h.live.events('session.instructions.append').length, 0);
+  h.twilio.receive({ event: 'media', media: { payload: NON_SILENT_FRAME } });
+  assert.equal(h.live.events('session.input_audio.append').at(-1).audio, FRAME);
+
+  h.live.receive({ type: 'session.updated', client_event_id: update.event_id });
+  assert.equal(h.controller.getSummary().isOwner, true);
+  const instruction = h.live.events('session.instructions.append')[0];
+  assert.match(instruction.content, /server has verified the owner PIN/);
+  assert.match(instruction.content, /web search and read-only inspection/);
+  h.twilio.receive({ event: 'media', media: { payload: NON_SILENT_FRAME } });
+  assert.equal(h.live.events('session.input_audio.append').at(-1).audio, NON_SILENT_FRAME);
+  h.created('response_verified');
+  h.call('response_verified', 'call_verified', { maxFiles: 2 });
+  h.completed('response_verified');
+  await tick();
+  assert.equal(h.executions.length, 1);
+  assert.equal(h.executions[0].context.isOwner, true);
+  assert.equal(JSON.parse(h.live.events('response.item.create').at(-1).item.output).ok, true);
+  h.live.receive({ type: 'session.updated', client_event_id: update.event_id });
+  assert.equal(h.live.events('session.instructions.append').length, 1, 'duplicate acknowledgment cannot repeat promotion');
+
+  h.controller.close('test_done');
+  h.live.receive({ type: 'session.closed', usage: { seconds: 1 } });
+  assert.equal(JSON.stringify(h.live.sent).includes(FAKE_OWNER_PIN), false, 'PIN digits never reach OpenAI commands');
+  assert.equal(JSON.stringify(h.logs).includes(FAKE_OWNER_PIN), false, 'PIN digits never reach application logs');
+  assert.equal(h.live.sent.some((event) => event.type === 'dtmf' || event.event === 'dtmf'), false);
+});
+
+test('failed, oversized, and skipped PIN entry stays public for the rest of the call', async (t) => {
+  for (const [name, digits, expectedAttempts] of [
+    ['wrong', '0000#', ['0000']],
+    ['oversized', `${'9'.repeat(13)}#`, []],
+    ['skipped', '*', []],
+  ]) {
+    await t.test(name, async (t) => {
+      const h = harness(t, { ownerVerificationPending: true });
+      await h.ready();
+      for (const digit of digits) h.dtmf(digit);
+      assert.deepEqual(h.pinAttempts, expectedAttempts);
+      assert.equal(h.controller.getSummary().isOwner, false);
+      assert.equal(h.live.events('session.update').length, 1);
+      const update = h.live.events('session.update')[0];
+      assert.deepEqual(update.session.delegation.responses.tools, []);
+      assert.equal(update.session.delegation.responses.tool_choice, 'none');
+      assert.match(update.session.delegation.responses.instructions, /public permissions/);
+      assert.equal(h.live.events('session.instructions.append').length, 0);
+      h.enterPin();
+      assert.deepEqual(h.pinAttempts, expectedAttempts, 'a failed or skipped attempt cannot be retried in this call');
+      h.twilio.receive({ event: 'media', media: { payload: NON_SILENT_FRAME } });
+      assert.equal(h.live.events('session.input_audio.append').at(-1).audio, FRAME, 'audio remains masked until the public configuration is acknowledged');
+      h.live.receive({ type: 'session.updated', client_event_id: 'unrelated_public_update' });
+      assert.equal(h.live.events('session.instructions.append').length, 0);
+      h.live.receive({ type: 'session.updated', client_event_id: update.event_id });
+      assert.match(h.live.events('session.instructions.append')[0].content, /without owner access/);
+      h.enterPin();
+      assert.deepEqual(h.pinAttempts, expectedAttempts);
+      assert.equal(h.live.events('session.instructions.append').length, 1);
+      assert.equal(h.live.events('session.update').length, 1);
+      h.twilio.receive({ event: 'media', media: { payload: NON_SILENT_FRAME } });
+      assert.equal(h.live.events('session.input_audio.append').at(-1).audio, NON_SILENT_FRAME, 'public conversation resumes without masking');
+      h.created('response_after_failed_pin');
+      h.call('response_after_failed_pin', 'call_after_failed_pin');
+      h.completed('response_after_failed_pin');
+      await tick();
+      assert.equal(h.executions.length, 0);
+      assert.equal(JSON.parse(h.live.events('response.item.create')[0].item.output).reason, 'unauthorized');
+      assert.equal(h.twilio.readyState, 1);
+    });
+  }
+});
+
+test('PIN entry timeout resumes public conversation and cannot be retried', async (t) => {
+  const h = harness(t, { ownerVerificationPending: true, limits: { ownerPinTimeoutMs: 10 } });
+  await h.ready();
+  h.dtmf(FAKE_OWNER_PIN[0]);
+  await pause(25);
+  assert.equal(h.controller.getSummary().isOwner, false);
+  assert.deepEqual(h.pinAttempts, []);
+  assert.equal(h.live.events('session.update').length, 1);
+  const update = h.live.events('session.update')[0];
+  assert.deepEqual(update.session.delegation.responses.tools, []);
+  assert.equal(update.session.delegation.responses.tool_choice, 'none');
+  assert.equal(h.live.events('session.instructions.append').length, 0);
+  h.enterPin();
+  assert.deepEqual(h.pinAttempts, []);
+  h.live.receive({ type: 'session.updated', client_event_id: update.event_id });
+  assert.match(h.live.events('session.instructions.append')[0].content, /without owner access/);
+  h.enterPin();
+  assert.deepEqual(h.pinAttempts, []);
+  assert.equal(h.live.events('session.instructions.append').length, 1);
+  assert.equal(h.twilio.readyState, 1);
+});
+
+test('public grants and truthy non-boolean pending flags cannot promote callers by keypad', async (t) => {
+  for (const pending of [false, 'true', 1]) {
+    await t.test(String(pending), async (t) => {
+      const h = harness(t, { isOwner: false, ownerVerificationPending: pending });
+      await h.ready();
+      h.enterPin();
+      assert.deepEqual(h.pinAttempts, []);
+      assert.equal(h.live.events('session.update').length, 0);
+      assert.equal(h.controller.getSummary().isOwner, false);
+      assert.match(h.live.events('session.start')[0].session.input[0].content[0].text, /How can I help you today/);
+      h.twilio.receive({ event: 'media', media: { payload: NON_SILENT_FRAME } });
+      assert.equal(h.live.events('session.input_audio.append')[0].audio, NON_SILENT_FRAME);
+    });
+  }
+});
+
+test('keypad input before session.started is ignored rather than buffered as a PIN', async (t) => {
+  const h = harness(t, { ownerVerificationPending: true });
+  h.enterPin();
+  await h.start();
+  h.enterPin();
+  h.live.open();
+  h.enterPin();
+  assert.deepEqual(h.pinAttempts, []);
+  assert.equal(h.live.events('session.update').length, 0);
+  h.live.receive({ type: 'session.started', session: { id: 'sess_pending' } });
+  h.enterPin();
+  assert.deepEqual(h.pinAttempts, [FAKE_OWNER_PIN]);
+  assert.equal(h.live.events('session.update').length, 1);
+});
+
+test('rejected or unacknowledged owner updates close without enabling tools or retrying', async (t) => {
+  for (const [failure, verified] of [['rejected', true], ['timeout', true], ['rejected', false], ['timeout', false]]) {
+    await t.test(`${failure}, ${verified ? 'verified' : 'public'} outcome`, async (t) => {
+      const h = harness(t, { ownerVerificationPending: true, limits: { ownerUpdateTimeoutMs: 10 } });
+      await h.ready();
+      if (verified) h.enterPin();
+      else h.dtmf('*');
+      const update = h.live.events('session.update')[0];
+      if (failure === 'rejected') {
+        h.live.receive({ type: 'error', client_event_id: update.event_id, error: { code: 'invalid_update' } });
+      } else {
+        h.live.receive({ type: 'session.updated', client_event_id: 'unrelated_update' });
+        await pause(25);
+      }
+      assert.equal(h.controller.getSummary().reason, failure === 'rejected' ? 'provider_error' : 'owner_update_timeout');
+      assert.equal(h.controller.getSummary().isOwner, false);
+      assert.equal(h.twilio.readyState, 3);
+      assert.equal(h.live.events('session.close').length, 1);
+      assert.equal(h.live.events('session.update').length, 1);
+      h.live.receive({ type: 'session.updated', client_event_id: update.event_id });
+      assert.equal(h.controller.getSummary().isOwner, false, 'a late acknowledgment cannot reopen a closing call');
+      assert.equal(h.live.events('session.instructions.append').length, 0);
+    });
+  }
+});
+
+test('shutdown cancels pending verification and owner update activity', async (t) => {
+  for (const awaitingUpdate of [false, true]) {
+    await t.test(awaitingUpdate ? 'awaiting update' : 'awaiting PIN', async (t) => {
+      const h = harness(t, {
+        ownerVerificationPending: true,
+        limits: { ownerPinTimeoutMs: 10, ownerUpdateTimeoutMs: 10, closeTimeoutMs: 100 },
+      });
+      await h.ready();
+      if (awaitingUpdate) h.enterPin();
+      const update = h.live.events('session.update')[0];
+      h.controller.close('server_shutdown');
+      await pause(25);
+      if (update) h.live.receive({ type: 'session.updated', client_event_id: update.event_id });
+      h.enterPin();
+      assert.equal(h.controller.getSummary().reason, 'server_shutdown');
+      assert.equal(h.controller.getSummary().isOwner, false);
+      assert.equal(h.live.events('session.instructions.append').length, 0, 'verification timeout cannot speak after shutdown');
+      assert.equal(h.live.events('session.close').length, 1);
+      assert.equal(h.live.events('session.update').length, awaitingUpdate ? 1 : 0);
+      assert.equal(h.pinAttempts.length, awaitingUpdate ? 1 : 0);
+      h.live.receive({ type: 'session.closed', usage: { seconds: 0 } });
+    });
+  }
 });
 
 test('usage uses cumulative voice snapshots and counts each backend response only once', async (t) => {
@@ -472,17 +726,20 @@ test('unacknowledged phone playback remains bounded and closes instead of growin
   assert.equal(h.live.events('session.close').length, 1);
 });
 
-test('pre-readiness phone audio is bounded while the provider starts', async (t) => {
-  const h = harness(t, { limits: { maxPendingInputBytes: 160 } });
+test('more than two seconds of setup audio is discarded without closing or replaying a burst', async (t) => {
+  const h = harness(t);
   await h.start();
   h.live.open();
-  h.twilio.receive({ event: 'media', media: { payload: FRAME } });
-  h.twilio.receive({ event: 'media', media: { payload: FRAME } });
-  assert.equal(h.twilio.readyState, 3);
+  for (let frame = 0; frame < 150; frame += 1) {
+    h.twilio.receive({ event: 'media', media: { payload: NON_SILENT_FRAME } });
+  }
+  assert.equal(h.twilio.readyState, 1);
   assert.equal(h.live.events('session.input_audio.append').length, 0);
   h.live.receive({ type: 'session.started', session: { id: 'sess_late' } });
-  assert.equal(h.live.events('session.close').length, 1);
+  assert.equal(h.live.events('session.close').length, 0);
   assert.equal(h.live.events('session.input_audio.append').length, 0);
+  h.twilio.receive({ event: 'media', media: { payload: FRAME } });
+  assert.deepEqual(h.live.events('session.input_audio.append').map((event) => event.audio), [FRAME]);
 });
 
 test('backend work cannot exceed the session response budget', async (t) => {

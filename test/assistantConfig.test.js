@@ -5,6 +5,7 @@ import {
   executeCodeTool,
   getBackendTools,
   OWNER_GREETING,
+  OWNER_PIN_GREETING,
   PUBLIC_GREETING,
 } from '../src/assistantConfig.js';
 
@@ -22,6 +23,7 @@ test('Live uses native phone audio, an independent reasoning backend, and no per
   assert.ok(session.delegation.responses.max_output_tokens <= 800);
   assert.match(session.instructions, /no persistent memory/i);
   assert.match(session.instructions, /cannot disconnect the call/);
+  assert.match(session.instructions, /warm, gentle, relaxed voice/);
   assert.match(session.delegation.responses.instructions, /untrusted information/);
 });
 
@@ -53,6 +55,37 @@ test('owner gets hosted search and only the three read-only code functions', () 
   }
   functions[0].parameters.properties.maxFiles.maximum = 1000;
   assert.equal(getBackendTools(true)[1].parameters.properties.maxFiles.maximum, 100);
+});
+
+test('pending owner verification uses Marin keypad instructions without granting tools', () => {
+  for (const isOwner of [false, true, 'true', 1]) {
+    const session = buildLiveSession({ isOwner, ownerVerificationPending: true });
+    assert.equal(session.audio.output.voice, 'marin');
+    assert.ok(session.instructions.includes(OWNER_PIN_GREETING));
+    assert.ok(!session.instructions.includes(OWNER_GREETING));
+    assert.deepEqual(session.delegation.responses.tools, []);
+    assert.equal(session.delegation.responses.tool_choice, 'none');
+    assert.match(session.instructions, /never request, repeat, guess, or accept a spoken PIN/);
+    assert.match(session.instructions, /wait for a trusted server instruction/);
+    assert.match(session.instructions, /Only after the server confirms owner verification/);
+    assert.match(session.delegation.responses.instructions, /private access is not authorized/);
+    assert.match(session.delegation.responses.instructions, /Do not claim verification or access has succeeded/);
+    assert.ok(!JSON.stringify(session).includes('TWILIO_OWNER_PIN'));
+  }
+});
+
+test('pending verification accepts only the boolean true and verified promotion gets owner scope', () => {
+  for (const ownerVerificationPending of [false, undefined, 'true', 1]) {
+    const publicSession = buildLiveSession({ ownerVerificationPending });
+    assert.ok(publicSession.instructions.includes(PUBLIC_GREETING));
+    assert.ok(!publicSession.instructions.includes(OWNER_PIN_GREETING));
+    const ownerSession = buildLiveSession({ isOwner: true, ownerVerificationPending });
+    assert.ok(ownerSession.instructions.includes(OWNER_GREETING));
+    assert.equal(ownerSession.delegation.responses.tool_choice, 'auto');
+  }
+  const verifiedBackend = buildLiveSession({ isOwner: true }).delegation.responses;
+  assert.match(verifiedBackend.instructions, /server-authorized for Tom/);
+  assert.deepEqual(verifiedBackend.tools, getBackendTools(true));
 });
 
 test('code execution checks server authorization and the function allowlist independently', async () => {

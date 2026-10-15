@@ -1,6 +1,6 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import { randomUUID } from 'node:crypto';
-import { buildLiveSession, executeCodeTool, OWNER_GREETING, PUBLIC_GREETING } from './assistantConfig.js';
+import { buildLiveSession, executeCodeTool, OWNER_GREETING, OWNER_PIN_GREETING, PUBLIC_GREETING } from './assistantConfig.js';
 
 const LIVE_ENDPOINT = 'wss://api.openai.com/v1/live/sessions';
 const DEFAULT_LIMITS = {
@@ -8,11 +8,12 @@ const DEFAULT_LIMITS = {
   closeTimeoutMs: 15_000,
   toolTimeoutMs: 10_000,
   backendTimeoutMs: 30_000,
+  ownerPinTimeoutMs: 30_000,
+  ownerUpdateTimeoutMs: 10_000,
   maxCallMs: 30 * 60_000,
   maxBackendResponses: 24,
   maxCustomCalls: 24,
   maxQueuedAudioMs: 2000,
-  maxPendingInputBytes: 16_000,
 };
 
 export function connectToLive({ apiKey } = {}) {
@@ -49,10 +50,13 @@ export function attachLiveCall(socket, {
   let closing = false;
   let finished = false;
   let isOwner = false;
+  let ownerVerificationPending = false;
+  let pinInput = '';
+  let ownerPinTimer = null;
+  let ownerUpdateTimer = null;
+  let ownerUpdate = null;
   let closeTimer = null;
   let callTimer = null;
-  let pendingInput = [];
-  let pendingInputBytes = 0;
   let queuedAudioBytes = 0;
   let markSequence = 0;
   let toolQueue = Promise.resolve();
@@ -103,12 +107,14 @@ export function attachLiveCall(socket, {
     clearTimeout(closeTimer);
     clearTimeout(callTimer);
     clearTimeout(continuationTimer);
+    clearTimeout(ownerPinTimer);
+    clearTimeout(ownerUpdateTimer);
+    pinInput = '';
     for (const batch of responses.values()) clearTimeout(batch.timer);
     responses.clear();
     delegationResponses.clear();
     seenCalls.clear();
     marks.clear();
-    pendingInput = [];
     closeSocket(live);
     closeSocket(socket);
     logger.info('[Live] call ended', structuredClone(summary));
@@ -122,8 +128,10 @@ export function attachLiveCall(socket, {
     clearTimeout(startTimer);
     clearTimeout(callTimer);
     clearTimeout(continuationTimer);
+    clearTimeout(ownerPinTimer);
+    clearTimeout(ownerUpdateTimer);
+    pinInput = '';
     for (const batch of responses.values()) clearTimeout(batch.timer);
-    pendingInput = [];
     clearPlayback();
     closeSocket(socket);
     closeTimer = setTimeout(() => {
@@ -139,6 +147,20 @@ export function attachLiveCall(socket, {
   };
   const startTimer = setTimeout(() => close('startup_timeout'), limits.startTimeoutMs);
   startTimer.unref?.();
+
+  const verifyOwner = (verified) => {
+    clearTimeout(ownerPinTimer);
+    pinInput = '';
+    ownerUpdate = { eventId: randomUUID(), isOwner: verified };
+    const { instructions, tools, tool_choice } = buildLiveSession({ isOwner: verified }).delegation.responses;
+    // Both outcomes replace the pending backend instructions. Tools stay
+    // disabled locally until the matching provider acknowledgment.
+    if (!send(live, { type: 'session.update', event_id: ownerUpdate.eventId,
+      session: { delegation: { responses: { instructions, tools, tool_choice } } },
+    })) return close('owner_update_failed');
+    ownerUpdateTimer = setTimeout(() => close('owner_update_timeout'), limits.ownerUpdateTimeoutMs);
+    ownerUpdateTimer.unref?.();
+  };
 
   const updateVoiceUsage = (usage) => {
     if (Number.isFinite(usage?.seconds) && usage.seconds >= 0) summary.voiceSeconds = usage.seconds;
@@ -288,11 +310,24 @@ export function attachLiveCall(socket, {
         clearTimeout(startTimer);
         callTimer = setTimeout(() => close('call_duration_limit'), limits.maxCallMs);
         callTimer.unref?.();
-        for (const audio of pendingInput) {
-          if (!send(live, { type: 'session.input_audio.append', audio })) return close('input_delivery_failed');
+        if (ownerVerificationPending) {
+          ownerPinTimer = setTimeout(() => verifyOwner(false), limits.ownerPinTimeoutMs);
+          ownerPinTimer.unref?.();
         }
-        pendingInput = [];
-        pendingInputBytes = 0;
+        logger.info('[Live] session ready', { sessionId: summary.sessionId, isOwner, ownerVerificationPending });
+      } else if (!closing && ownerUpdate && event.type === 'session.updated'
+        && event.client_event_id === ownerUpdate.eventId) {
+        clearTimeout(ownerUpdateTimer);
+        isOwner = ownerUpdate.isOwner;
+        ownerUpdate = null;
+        ownerVerificationPending = false;
+        summary.isOwner = isOwner;
+        if (!command({ type: 'session.instructions.append', delegation_id: null,
+          content: isOwner
+            ? 'The server has verified the owner PIN. You are now speaking directly with Tom; address him as you and your. Public web search and read-only inspection of this running service are now authorized. Do not request or repeat a PIN. Say: Hey Tom, you are all set. What is on your mind? Then listen. Delegate current facts and authorized tool requests to the backend.'
+            : 'Server verification is finished without owner access. Private tools remain unavailable for this call. Do not ask for another PIN. Say: We can keep chatting without private tools. How can I help? Continue with public caller permissions.',
+        })) return close('owner_update_failed');
+        if (isOwner) logger.info('[Live] owner access enabled');
       } else if (event.type === 'session.usage.updated') {
         updateVoiceUsage(event.usage);
       } else if (!closing && event.type === 'session.output_audio.delta') {
@@ -332,6 +367,7 @@ export function attachLiveCall(socket, {
         if (!grant || !event.start.streamSid) return close('unauthorized_stream');
         streamSid = event.start.streamSid;
         isOwner = grant.isOwner === true;
+        ownerVerificationPending = !isOwner && grant.ownerVerificationPending === true;
         summary.isOwner = isOwner;
         // Untrusted custom caller numbers and caller-provided roles are ignored.
         live = connectLive({ isOwner });
@@ -346,9 +382,10 @@ export function attachLiveCall(socket, {
         });
         live.on('open', () => {
           if (closing) return closeSocket(live);
-          const session = buildLiveSession({ isOwner });
+          const session = buildLiveSession({ isOwner, ownerVerificationPending });
+          const greeting = ownerVerificationPending ? OWNER_PIN_GREETING : isOwner ? OWNER_GREETING : PUBLIC_GREETING;
           session.input = [{ type: 'message', role: 'developer', content: [{ type: 'input_text',
-            text: `Speak English. Greet the caller first with exactly: ${isOwner ? OWNER_GREETING : PUBLIC_GREETING} Then listen.` }] }];
+            text: `Speak English. Greet the caller first with exactly: ${greeting} Then listen.` }] }];
           startSent = command({ type: 'session.start', session });
           if (!startSent) close('session_start_failed');
         });
@@ -358,11 +395,23 @@ export function attachLiveCall(socket, {
         const bytes = audioBytes(payload);
         if (bytes == null || bytes > 8000) return close('invalid_input_audio');
         if (event.media.track && event.media.track !== 'inbound') return;
-        if (!started) {
-          pendingInputBytes += bytes;
-          if (pendingInputBytes > limits.maxPendingInputBytes) return close('startup_audio_overflow');
-          pendingInput.push(payload);
-        } else if (!send(live, { type: 'session.input_audio.append', audio: payload })) close('input_delivery_failed');
+        // Listening begins when Live is ready. Never accumulate setup audio or
+        // replay it in a burst: Live requires a continuous, realtime input pace.
+        if (!started) return;
+        // Keep the timeline moving so Marin can speak, while keeping keypad
+        // tones and any accidentally spoken PIN out of the model's audio.
+        const audio = ownerVerificationPending ? Buffer.alloc(bytes, 0xff).toString('base64') : payload;
+        if (!send(live, { type: 'session.input_audio.append', audio })) close('input_delivery_failed');
+      } else if (event.event === 'dtmf') {
+        if (!started || !ownerVerificationPending || ownerUpdate
+          || event.streamSid !== streamSid || event.dtmf?.track !== 'inbound') return;
+        const digit = event.dtmf.digit;
+        if (digit === '#') verifyOwner(security.verifyOwnerPin(pinInput) === true);
+        else if (digit === '*') verifyOwner(false);
+        else if (typeof digit === 'string' && /^\d$/.test(digit)) {
+          if (pinInput.length >= 12) verifyOwner(false);
+          else pinInput += digit;
+        }
       } else if (event.event === 'mark') {
         if (!marks.has(event.mark?.name)) return;
         for (const [name, bytes] of marks) {

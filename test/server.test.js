@@ -43,6 +43,15 @@ class FakeLiveSocket extends EventEmitter {
           this.emit('message', JSON.stringify({ type: 'session.closed', usage: { seconds: 0 } }));
         }
       });
+    } else if (command.type === 'session.update') {
+      this.emit('updateRequested', command);
+      queueMicrotask(() => {
+        if (this.readyState === WebSocket.OPEN) {
+          const acknowledgment = { type: 'session.updated', client_event_id: command.event_id };
+          this.emit('message', JSON.stringify(acknowledgment));
+          this.emit('updated', acknowledgment);
+        }
+      });
     }
   }
 
@@ -160,8 +169,12 @@ test('signed public webhook issues a grant and spoofed stream parameters cannot 
   const response = await app.post('/voice', { CallSid: callSid, From: publicPhone });
   assert.match(response.headers['content-type'], /text\/xml/);
   assert.equal((response.text.match(/<Parameter /g) || []).length, 1);
+  assert.doesNotMatch(response.text, /<Gather|<Say|<Redirect/);
+  assert.match(response.text, /<\/Connect><Hangup\/>/);
   const sessionPromise = started(app.events);
-  await app.startStream(grantFrom(response), { customerPhone: ownerPhone, isOwner: 'true', ownerVerified: 'true' });
+  await app.startStream(grantFrom(response), {
+    customerPhone: ownerPhone, isOwner: 'true', ownerVerified: 'true', ownerVerificationPending: 'true',
+  });
   const [{ isOwner, session }] = await sessionPromise;
   assert.equal(isOwner, false);
   assert.equal(session.model, 'gpt-live-1');
@@ -178,15 +191,51 @@ test('unsigned HTTP requests are forbidden before a provider can start', async (
   assert.equal(app.providers.length, 0);
 });
 
-test('signed owner caller receives DTMF verification before any provider starts', async (t) => {
+test('signed owner caller connects directly to Victoria without gaining private tools before verification', async (t) => {
   const app = await harness(t);
   const response = await app.post('/voice', { CallSid: callSid, From: ownerPhone });
   assert.equal(response.status, 200);
-  assert.match(response.text, /<Gather[^>]*input="dtmf"/);
-  assert.match(response.text, /action="\/voice\/owner"/);
-  assert.match(response.text, /<Redirect method="POST">\/voice\/public<\/Redirect>/);
-  assert.doesNotMatch(response.text, /grantToken/);
+  assert.doesNotMatch(response.text, /<Gather|<Say|<Redirect/);
+  assert.match(response.text, /<\/Connect><Hangup\/>/);
   assert.equal(app.providers.length, 0);
+  const sessionPromise = started(app.events);
+  await app.startStream(grantFrom(response));
+  const [{ isOwner, session }] = await sessionPromise;
+  assert.equal(isOwner, false);
+  assert.deepEqual(session.delegation.responses.tools, []);
+});
+
+test('signed owner call enables private tools after keypad verification and the matching Live update acknowledgment', async (t) => {
+  const app = await harness(t);
+  const response = await app.post('/voice', { CallSid: callSid, From: ownerPhone });
+  const sessionPromise = started(app.events);
+  const client = await app.startStream(grantFrom(response));
+  const [{ isOwner, session }] = await sessionPromise;
+  assert.equal(isOwner, false);
+  assert.deepEqual(session.delegation.responses.tools, []);
+  assert.equal(app.logs.find(([message]) => message === '[Live] session ready')[1].ownerVerificationPending, true);
+  const provider = app.providers[0];
+  let ownerEnabledBeforeAcknowledgment;
+  provider.once('updateRequested', () => {
+    ownerEnabledBeforeAcknowledgment = app.logs.some(([message]) => message === '[Live] owner access enabled');
+  });
+  const updateRequested = once(provider, 'updateRequested', { signal: AbortSignal.timeout(1000) });
+  const updated = once(provider, 'updated', { signal: AbortSignal.timeout(1000) });
+  for (const digit of '04231#') {
+    client.socket.send(JSON.stringify({ event: 'dtmf', streamSid, dtmf: { track: 'inbound', digit } }));
+  }
+  const [update] = await updateRequested;
+  assert.equal(ownerEnabledBeforeAcknowledgment, false);
+  assert.deepEqual(update.session.delegation.responses.tools.map((tool) => tool.name || tool.type), [
+    'web_search', 'get_codebase_overview', 'search_codebase', 'read_code_snippet',
+  ]);
+  const [acknowledgment] = await updated;
+  assert.equal(acknowledgment.client_event_id, update.event_id);
+  assert.equal(app.logs.filter(([message]) => message === '[Live] owner access enabled').length, 1);
+  assert.equal(app.providers.length, 1);
+  assert.equal(provider.commands.filter((command) => command.type === 'session.start').length, 1);
+  assert.equal(provider.commands.filter((command) => command.type === 'session.update').length, 1);
+  assert.equal(JSON.stringify({ commands: provider.commands, logs: app.logs }).includes('04231'), false);
 });
 
 test('only a correct PIN and signed owner caller grant private tools', async (t) => {

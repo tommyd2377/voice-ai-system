@@ -69,18 +69,20 @@ export function createCallSecurity({ authToken, ownerPhone, ownerPin, now = Date
 
   // Call only after validating the Twilio webhook. The stream's custom caller
   // parameters are deliberately ignored when this grant is consumed.
-  function issueGrant({ callSid, callerPhone, ownerVerified = false } = {}) {
+  function issueGrant({ callSid, callerPhone, ownerVerified = false, requestOwnerVerification = false } = {}) {
     if (!configured || typeof callSid !== 'string' || !CALL_SID_PATTERN.test(callSid)) return null;
     pruneGrants();
     while (grants.size >= MAX_GRANTS) grants.delete(grants.keys().next().value);
     const token = randomBytes(32).toString('base64url');
     const normalizedCaller = normalizePhone(callerPhone);
     const isOwnerCandidate = isOwnerPhone(callerPhone);
+    const isOwner = ownerVerified === true && canVerifyOwner && isOwnerCandidate;
     grants.set(token, {
       callSid,
       callerPhone: normalizedCaller,
       isOwnerCandidate,
-      isOwner: ownerVerified === true && canVerifyOwner && isOwnerCandidate,
+      isOwner,
+      ownerVerificationPending: requestOwnerVerification === true && canVerifyOwner && isOwnerCandidate && !isOwner,
       expiresAt: now() + GRANT_TTL_MS,
     });
     return token;
@@ -92,7 +94,12 @@ export function createCallSecurity({ authToken, ownerPhone, ownerPin, now = Date
     const grant = grants.get(token);
     if (!grant || grant.callSid !== callSid) return null;
     grants.delete(token);
-    return { callerPhone: grant.callerPhone, isOwnerCandidate: grant.isOwnerCandidate, isOwner: grant.isOwner };
+    return {
+      callerPhone: grant.callerPhone,
+      isOwnerCandidate: grant.isOwnerCandidate,
+      isOwner: grant.isOwner,
+      ownerVerificationPending: grant.ownerVerificationPending,
+    };
   }
 
   function verifyOwnerPin(pin) {

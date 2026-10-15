@@ -54,18 +54,18 @@ export function createVoiceServer({ env = process.env, logger = console, connect
     })) return res.sendStatus(403);
     next();
   };
-  const streamCall = (req, res, ownerVerified = false) => {
+  const streamCall = (req, res, { ownerVerified = false, requestOwnerVerification = false } = {}) => {
     const grantToken = security.issueGrant({
       callSid: req.body?.CallSid,
       callerPhone: req.body?.From,
       ownerVerified,
+      requestOwnerVerification,
     });
     if (!grantToken) return unavailable(res);
     const voice = new twilio.twiml.VoiceResponse();
     const stream = voice.connect().stream({ url: streamUrl });
     stream.parameter({ name: 'grantToken', value: grantToken });
     // Returning from the stream (including a provider failure) ends the call.
-    voice.say('The voice session has ended. Goodbye.');
     voice.hangup();
     return reply(res, voice);
   };
@@ -84,17 +84,14 @@ export function createVoiceServer({ env = process.env, logger = console, connect
     });
   });
   app.post('/voice', signedWebhook, (req, res) => {
-    if (!security.isOwnerPhone(req.body?.From) || !security.canVerifyOwner) return streamCall(req, res);
-    const voice = new twilio.twiml.VoiceResponse();
-    voice.gather({ input: 'dtmf', finishOnKey: '#', timeout: 8, action: '/voice/owner', method: 'POST' })
-      .say('For private tools, enter your owner PIN followed by the pound key. Or wait to continue without private tools.');
-    voice.redirect({ method: 'POST' }, '/voice/public');
-    reply(res, voice);
+    streamCall(req, res, {
+      requestOwnerVerification: security.isOwnerPhone(req.body?.From) && security.canVerifyOwner,
+    });
   });
   app.post('/voice/owner', signedWebhook, (req, res) => {
     const verified = security.isOwnerPhone(req.body?.From) && security.verifyOwnerPin(req.body?.Digits);
     if (!verified) logger.warn('[Voice] owner verification failed; continuing without private tools');
-    streamCall(req, res, verified);
+    streamCall(req, res, { ownerVerified: verified });
   });
   app.post('/voice/public', signedWebhook, (req, res) => streamCall(req, res));
   app.use((error, _req, res, _next) => {

@@ -38,17 +38,24 @@ rules. Current project status is not invented from an old project list.
 
 1. Twilio posts a signed form webhook to `/voice`.
 2. The server verifies `X-Twilio-Signature` against the configured public origin.
-3. A matching owner number is offered a DTMF PIN prompt when owner verification is
-   configured. The signed `/voice/owner` callback checks the PIN. A missing or
-   incorrect PIN continues as a public caller; there is no retry loop. A caller
-   claiming to be Tom in conversation cannot change permissions.
-4. The signed webhook issues an in-memory, single-use stream grant bound to the
+3. The signed webhook issues an in-memory, single-use stream grant bound to the
    call ID. Grants expire after 60 seconds; at most 1,024 are retained.
-5. The WebSocket upgrade signature and the stream's grant/call ID are checked
+4. The WebSocket upgrade signature and the stream's grant/call ID are checked
    before any OpenAI connection starts. Custom caller-number or role parameters
    supplied by a stream are ignored.
-6. The server sends `session.start` and waits for `session.started` before sending
-   caller audio. Startup buffering is bounded to two seconds of phone audio.
+5. The server sends `session.start` and waits for `session.started`. There can be
+   a short quiet pause before Victoria's first greeting. Wait for her greeting
+   before speaking or entering keypad digits; audio received before Live is ready
+   is deliberately not forwarded.
+6. When owner verification is configured and the caller number matches, Victoria
+   asks for the owner PIN in her normal Marin voice during the Live session.
+   Enter it on the keypad, then press pound; press star to continue without private
+   tools. The bridge checks Twilio's DTMF events and never sends PIN digits to
+   OpenAI or logs them. Until the server confirms verification, the session has no
+   tools. A missing or incorrect PIN continues with public permissions, without a
+   retry loop. Keypad entry has a 30-second deadline. Owner tools activate only
+   after Live acknowledges the backend update; a missing acknowledgment ends the
+   call after 10 seconds. Never say the PIN aloud; claiming to be Tom cannot grant access.
 7. Audio flows in both directions continuously. Live owns interruptions and
    turn-taking; the bridge does not cancel responses or discard output whenever
    a noise is detected. Twilio playback marks track audio actually played.
@@ -89,7 +96,7 @@ local environment or your deployment's secret manager. Never commit credentials.
 | `TWILIO_AUTH_TOKEN` | Required to verify Twilio HTTP and WebSocket signatures. |
 | `TWILIO_STREAM_URL` | Required public `wss://` stream URL, including its existing path. No query string or credentials. Its origin must match the public voice-webhook origin. |
 | `TWILIO_OWNER_PHONE` | Optional owner number; E.164 recommended. Matching alone does not enable private tools. |
-| `TWILIO_OWNER_PIN` | Optional owner verification PIN: 4–12 digits. Required with the matching owner number for owner tools. DTMF is collected by Twilio before the Live session, never sent to OpenAI or application logs. |
+| `TWILIO_OWNER_PIN` | Optional owner verification PIN: 4–12 digits. Required with the matching owner number for owner tools. Enter it using the keypad after Victoria's Marin prompt. The bridge verifies DTMF during the Live session; digits are never forwarded to OpenAI or application logs. |
 | `PORT` | Optional HTTP listening port; defaults to `8080`. |
 
 Missing required configuration makes `/voice` return 503. `/health` checks the
@@ -142,9 +149,9 @@ quality.
 
 ## Files
 
-- `src/server.js`: signed HTTP routes, owner PIN entry, TwiML, executable entry point.
+- `src/server.js`: signed HTTP routes, TwiML, executable entry point.
 - `src/callSecurity.js`: signature checks, owner verification, ephemeral stream grants.
-- `src/realtimeHandler.js`: Live/Twilio bridge and session/tool lifecycle.
+- `src/realtimeHandler.js`: Live/Twilio bridge, keypad owner verification, and session/tool lifecycle.
 - `src/assistantConfig.js`: voice/backend prompts, session configuration, tool contracts.
 - `src/codebaseData.js`: constrained source inspection.
 - `test/`: offline unit and mocked/loopback integration tests.

@@ -52,6 +52,7 @@ test('stream grants preserve verified caller identity, bind CallSid, and cannot 
     callerPhone: ownerPhone,
     isOwnerCandidate: true,
     isOwner: false,
+    ownerVerificationPending: false,
   });
   assert.equal(security.consumeGrant({ token, callSid }), null);
   assert.equal(security.consumeGrant({ token: 'forged', callSid }), null);
@@ -73,6 +74,7 @@ test('stream grants expire after 60 seconds and unused grants have bounded stora
     callerPhone: null,
     isOwnerCandidate: false,
     isOwner: false,
+    ownerVerificationPending: false,
   });
 });
 
@@ -121,4 +123,23 @@ test('owner access requires both the matching signed caller and server-verified 
       assert.equal(disabled.consumeGrant({ token, callSid }).isOwner, false);
     }
   }
+});
+
+test('owner verification is pending only for an explicitly requested eligible unverified caller', () => {
+  const security = createCallSecurity({ authToken, ownerPhone, ownerPin: '04231' });
+  for (const [options, expectedPending, expectedOwner] of [
+    [{ callerPhone: ownerPhone }, false, false],
+    [{ callerPhone: ownerPhone, requestOwnerVerification: true }, true, false],
+    [{ callerPhone: ownerPhone, requestOwnerVerification: 'true' }, false, false],
+    [{ callerPhone: '+12025550125', requestOwnerVerification: true }, false, false],
+    [{ callerPhone: ownerPhone, requestOwnerVerification: true, ownerVerified: true }, false, true],
+  ]) {
+    const token = security.issueGrant({ callSid, ...options });
+    const grant = security.consumeGrant({ token, callSid });
+    assert.equal(grant.ownerVerificationPending, expectedPending);
+    assert.equal(grant.isOwner, expectedOwner);
+  }
+  const unconfigured = createCallSecurity({ authToken, ownerPhone });
+  const token = unconfigured.issueGrant({ callSid, callerPhone: ownerPhone, requestOwnerVerification: true });
+  assert.equal(unconfigured.consumeGrant({ token, callSid }).ownerVerificationPending, false);
 });
