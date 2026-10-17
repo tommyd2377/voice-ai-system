@@ -1,10 +1,9 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import twilio from 'twilio';
 
 const GRANT_TTL_MS = 60_000;
 const MAX_GRANTS = 1024;
 const CALL_SID_PATTERN = /^CA[0-9a-f]{32}$/i;
-const PIN_PATTERN = /^\d{4,12}$/;
 
 function normalizePhone(value) {
   if (typeof value !== 'string' || !/^\+?[\d(). -]+$/.test(value)) return null;
@@ -33,13 +32,9 @@ export function publicWebhookUrl(streamUrl, originalUrl) {
   }
 }
 
-export function createCallSecurity({ authToken, ownerPhone, ownerPin, now = Date.now } = {}) {
+export function createCallSecurity({ authToken, ownerPhone, now = Date.now } = {}) {
   const configured = typeof authToken === 'string' && authToken.length > 0;
   const normalizedOwner = normalizePhone(ownerPhone);
-  const ownerPinHash = typeof ownerPin === 'string' && PIN_PATTERN.test(ownerPin)
-    ? createHash('sha256').update(ownerPin).digest()
-    : null;
-  const canVerifyOwner = Boolean(configured && normalizedOwner && ownerPinHash);
   const grants = new Map();
 
   function isOwnerPhone(callerPhone) {
@@ -69,20 +64,17 @@ export function createCallSecurity({ authToken, ownerPhone, ownerPin, now = Date
 
   // Call only after validating the Twilio webhook. The stream's custom caller
   // parameters are deliberately ignored when this grant is consumed.
-  function issueGrant({ callSid, callerPhone, ownerVerified = false, requestOwnerVerification = false } = {}) {
+  function issueGrant({ callSid, callerPhone } = {}) {
     if (!configured || typeof callSid !== 'string' || !CALL_SID_PATTERN.test(callSid)) return null;
     pruneGrants();
     while (grants.size >= MAX_GRANTS) grants.delete(grants.keys().next().value);
     const token = randomBytes(32).toString('base64url');
     const normalizedCaller = normalizePhone(callerPhone);
-    const isOwnerCandidate = isOwnerPhone(callerPhone);
-    const isOwner = ownerVerified === true && canVerifyOwner && isOwnerCandidate;
     grants.set(token, {
       callSid,
       callerPhone: normalizedCaller,
-      isOwnerCandidate,
-      isOwner,
-      ownerVerificationPending: requestOwnerVerification === true && canVerifyOwner && isOwnerCandidate && !isOwner,
+      // Recognition personalizes the greeting; all callers have the same tools.
+      isOwner: isOwnerPhone(callerPhone),
       expiresAt: now() + GRANT_TTL_MS,
     });
     return token;
@@ -96,16 +88,9 @@ export function createCallSecurity({ authToken, ownerPhone, ownerPin, now = Date
     grants.delete(token);
     return {
       callerPhone: grant.callerPhone,
-      isOwnerCandidate: grant.isOwnerCandidate,
       isOwner: grant.isOwner,
-      ownerVerificationPending: grant.ownerVerificationPending,
     };
   }
 
-  function verifyOwnerPin(pin) {
-    if (!configured || !ownerPinHash || typeof pin !== 'string' || !PIN_PATTERN.test(pin)) return false;
-    return timingSafeEqual(ownerPinHash, createHash('sha256').update(pin).digest());
-  }
-
-  return { validateWebhook, issueGrant, consumeGrant, isOwnerPhone, canVerifyOwner, verifyOwnerPin };
+  return { validateWebhook, issueGrant, consumeGrant, isOwnerPhone };
 }

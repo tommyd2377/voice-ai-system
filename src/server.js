@@ -27,16 +27,11 @@ export function createVoiceServer({ env = process.env, logger = console, connect
   const security = createCallSecurity({
     authToken: env.TWILIO_AUTH_TOKEN,
     ownerPhone: env.TWILIO_OWNER_PHONE,
-    ownerPin: env.TWILIO_OWNER_PIN,
   });
   const missingConfiguration = [
     ...(!streamUrl ? ['TWILIO_STREAM_URL'] : []),
     ...(!env.TWILIO_AUTH_TOKEN ? ['TWILIO_AUTH_TOKEN'] : []),
     ...(!env.OPENAI_API_KEY ? ['OPENAI_API_KEY'] : []),
-  ];
-  const missingOwnerConfiguration = [
-    ...(!security.isOwnerPhone(env.TWILIO_OWNER_PHONE) ? ['TWILIO_OWNER_PHONE'] : []),
-    ...(!/^\d{4,12}$/.test(env.TWILIO_OWNER_PIN || '') ? ['TWILIO_OWNER_PIN'] : []),
   ];
   const reply = (res, voice) => res.type('text/xml').send(voice.toString());
   const unavailable = (res) => {
@@ -54,12 +49,10 @@ export function createVoiceServer({ env = process.env, logger = console, connect
     })) return res.sendStatus(403);
     next();
   };
-  const streamCall = (req, res, { ownerVerified = false, requestOwnerVerification = false } = {}) => {
+  const streamCall = (req, res) => {
     const grantToken = security.issueGrant({
       callSid: req.body?.CallSid,
       callerPhone: req.body?.From,
-      ownerVerified,
-      requestOwnerVerification,
     });
     if (!grantToken) return unavailable(res);
     const voice = new twilio.twiml.VoiceResponse();
@@ -78,22 +71,12 @@ export function createVoiceServer({ env = process.env, logger = console, connect
       backendModel: session.delegation.responses.model,
       revision: /^[a-f0-9]{40}$/i.test(env.RAILWAY_GIT_COMMIT_SHA || '') ? env.RAILWAY_GIT_COMMIT_SHA : null,
       configurationReady: missingConfiguration.length === 0,
-      ownerToolsConfigured: security.canVerifyOwner,
+      toolsAvailable: true,
+      ownerRecognitionConfigured: security.isOwnerPhone(env.TWILIO_OWNER_PHONE),
       missingConfiguration,
-      missingOwnerConfiguration,
     });
   });
-  app.post('/voice', signedWebhook, (req, res) => {
-    streamCall(req, res, {
-      requestOwnerVerification: security.isOwnerPhone(req.body?.From) && security.canVerifyOwner,
-    });
-  });
-  app.post('/voice/owner', signedWebhook, (req, res) => {
-    const verified = security.isOwnerPhone(req.body?.From) && security.verifyOwnerPin(req.body?.Digits);
-    if (!verified) logger.warn('[Voice] owner verification failed; continuing without private tools');
-    streamCall(req, res, { ownerVerified: verified });
-  });
-  app.post('/voice/public', signedWebhook, (req, res) => streamCall(req, res));
+  app.post(['/voice', '/voice/owner', '/voice/public'], signedWebhook, streamCall);
   app.use((error, _req, res, _next) => {
     logger.warn('[Voice] rejected malformed request');
     res.sendStatus(error.status === 413 ? 413 : 400);

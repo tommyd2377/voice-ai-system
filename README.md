@@ -1,8 +1,8 @@
 # Victoria Voice Assistant
 
 Victoria answers phone calls through Twilio and GPT-Live. Public callers can talk
-about Tom's professional and creative background. Verified owner calls also have
-public web search and read-only inspection of this service's current source code.
+about Tom's professional and creative background. Every caller has public web
+search and protected read-only inspection of this service's current source code.
 There is no database integration, message saving, task management, persistent
 conversation memory, calendar, email, SMS, or outbound action tool.
 
@@ -27,12 +27,21 @@ flowchart LR
   preserved; it now connects to `/v1/live/sessions`, with no model query string.
 - Storage: `store: false`; no recordings, transcripts, caller messages, or call
   history are persisted by this application. Operational summaries omit phone
-  numbers, PINs, grants, transcript text, and tool contents.
+  numbers, grants, transcript text, and tool contents.
 
 The voice and backend prompts are separate in `src/assistantConfig.js`. The voice
 prompt defines Victoria's personality, greeting, interruption behavior, and when
-to delegate. The backend prompt supplies background facts, permissions, and tool
-rules. Current project status is not invented from an old project list.
+to delegate. It includes a small public profile so simple questions about Tom can
+be answered directly. Tom, Thomas, and Tom DeVito refer to Thomas DeVito on this
+phone line unless the caller means someone else. The backend supplies detailed
+background, a dated public portfolio snapshot, and tool rules. Portfolio descriptions
+do not establish live availability or completed functionality.
+
+Victoria generates her greeting live in Marin's voice; no prerecorded audio file
+is used. The startup input asks her to begin immediately, while her voice prompt
+asks for warm, gentle, slightly slower, unhurried speech with brief pauses. Pacing
+is controlled through instructions, with no API speed parameter. Recognizing Tom's
+number changes the greeting and pronouns only; it does not change tool access.
 
 ## Call flow and permissions
 
@@ -40,35 +49,30 @@ rules. Current project status is not invented from an old project list.
 2. The server verifies `X-Twilio-Signature` against the configured public origin.
 3. The signed webhook issues an in-memory, single-use stream grant bound to the
    call ID. Grants expire after 60 seconds; at most 1,024 are retained.
-4. The WebSocket upgrade signature and the stream's grant/call ID are checked
-   before any OpenAI connection starts. Custom caller-number or role parameters
-   supplied by a stream are ignored.
-5. The server sends `session.start` and waits for `session.started`. There can be
-   a short quiet pause before Victoria's first greeting. Wait for her greeting
-   before speaking or entering keypad digits; audio received before Live is ready
-   is deliberately not forwarded.
-6. When owner verification is configured and the caller number matches, Victoria
-   asks for the owner PIN in her normal Marin voice during the Live session.
-   Enter it on the keypad, then press pound; press star to continue without private
-   tools. The bridge checks Twilio's DTMF events and never sends PIN digits to
-   OpenAI or logs them. Until the server confirms verification, the session has no
-   tools. A missing or incorrect PIN continues with public permissions, without a
-   retry loop. Keypad entry has a 30-second deadline. Owner tools activate only
-   after Live acknowledges the backend update; a missing acknowledgment ends the
-   call after 10 seconds. Never say the PIN aloud; claiming to be Tom cannot grant access.
-7. Audio flows in both directions continuously. Live owns interruptions and
+4. A valid Twilio WebSocket upgrade starts the OpenAI transport connection while
+   the bridge waits for the stream's single-use grant and call ID. This overlaps
+   transport setup with the phone start event. Unsigned upgrades never connect to
+   OpenAI; at most eight connections may wait for a valid start, with a 15-second
+   startup deadline. Caller-number or role custom parameters are ignored.
+5. Only after a valid stream grant and an open provider connection does the server
+   send `session.start`, with the greeting in the initial input. It waits for
+   `session.started` before forwarding phone audio. Setup audio is discarded,
+   never queued or replayed in a burst. There is no PIN prompt or DTMF verification.
+   `/voice/owner` and `/voice/public` remain signed compatibility routes with the
+   same behavior as `/voice`; `Digits` does not authenticate a caller.
+6. Audio flows in both directions continuously. Live owns interruptions and
    turn-taking; the bridge does not cancel responses or discard output whenever
    a noise is detected. Twilio playback marks track audio actually played.
-8. Hosted search runs inside the Responses backend. Custom code functions are
-   collected by response and call ID, authorized again in Node, deduplicated,
+7. Hosted search runs inside the Responses backend. Custom code functions are
+   collected by response and call ID, validated in Node, deduplicated,
    executed sequentially, and returned with `response.item.create` followed by
    `response.create` only after all known pending calls have their results.
-9. A caller stop, failure, or duration/budget limit stops new work, aborts pending
+8. A caller stop, failure, or duration/budget limit stops new work, aborts pending
    custom tools, and requests `session.close`. The connection stays open for
    final `session.closed` usage, with a 15-second finalization deadline. There is
    no automatic reconnect or paid retry. Returning from the stream ends the call.
 
-Public sessions receive **no tools**. Verified owner sessions receive:
+Every caller receives the same tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -95,16 +99,18 @@ local environment or your deployment's secret manager. Never commit credentials.
 | `OPENAI_API_KEY` | Required server-side OpenAI access. Never sent to the caller. |
 | `TWILIO_AUTH_TOKEN` | Required to verify Twilio HTTP and WebSocket signatures. |
 | `TWILIO_STREAM_URL` | Required public `wss://` stream URL, including its existing path. No query string or credentials. Its origin must match the public voice-webhook origin. |
-| `TWILIO_OWNER_PHONE` | Optional owner number; E.164 recommended. Matching alone does not enable private tools. |
-| `TWILIO_OWNER_PIN` | Optional owner verification PIN: 4–12 digits. Required with the matching owner number for owner tools. Enter it using the keypad after Victoria's Marin prompt. The bridge verifies DTMF during the Live session; digits are never forwarded to OpenAI or application logs. |
+| `TWILIO_OWNER_PHONE` | Optional number recognition for Tom's greeting and pronouns; E.164 recommended. Does not control tool access. |
 | `PORT` | Optional HTTP listening port; defaults to `8080`. |
 
 Missing required configuration makes `/voice` return 503. `/health` checks the
-HTTP process only; it does not verify OpenAI access or call quality. Without valid
-owner verification configuration, calls continue with public permissions.
-The health response also reports model names, the deployment revision when available,
-and missing required/owner configuration names. It never returns credential values;
+HTTP process only; it does not verify OpenAI access or call quality. The health
+response reports model names, the deployment revision when available,
+`toolsAvailable: true`, `ownerRecognitionConfigured` for optional number recognition,
+and missing required configuration names. It never returns credential values;
 configuration presence does not verify that credentials are valid.
+
+`TWILIO_OWNER_PIN` is obsolete and unused. An existing deployment value can remain
+in place; these changes do not read or modify it.
 
 The configured public origin is used for signature checks; caller-controlled
 Host/forwarding headers are not trusted. If the webhook and stream use different
@@ -131,27 +137,36 @@ calls as a test without explicit host/app and call-budget approval.
 `npm test` uses fake credentials, mocked provider sockets, synthetic source
 fixtures, and loopback-only HTTP/WebSocket tests. It does not load `.env`, contact
 OpenAI/Twilio, or start emulators. Tests cover Live startup/readiness, full-duplex
-media and playback marks, signed ingress, PIN/grant permissions, tool-call
-correlation and duplicate suppression, failure/timeout shutdown, and cumulative
+media and playback marks, signed ingress, grant validation, equal tool access,
+tool-call correlation and duplicate suppression, failure/timeout shutdown, and cumulative
 usage accounting. No separate build or lint scripts are configured.
 
 Default runtime limits are in `src/realtimeHandler.js`: 15-second startup and
 finalization deadlines, 10-second custom-tool and 30-second backend deadlines,
-30-minute calls, 24 backend responses and custom calls per call, and two seconds
-of unacknowledged playback. Exceeding a limit ends the session rather than
-silently dropping speech or retrying. These are application guardrails, not an
-exact monetary spend cap; hosted searches and backend tokens are billed separately.
+eight pending startup connections, 30-minute calls, 24 backend responses and custom
+calls per call, and two seconds of unacknowledged playback. Exceeding a limit ends
+the session rather than silently dropping speech or retrying. These are application
+guardrails, not an exact monetary spend cap; hosted searches and backend tokens are
+billed separately.
 
-A real phone call is still needed before release to check audible quality,
-interruptions, greeting timing, search latency, and final call teardown. Offline
-success establishes the bridge logic, not provider availability or listening
-quality.
+Call summaries include monotonic elapsed timings, measured from acceptance of the
+phone WebSocket: `providerConnectMs`, `phoneStartMs`, `providerOpenMs`,
+`sessionStartSentMs`, `sessionReadyMs`, `firstInputAudioMs`, `firstOutputAudioMs`,
+and `firstPlaybackAckMs`. Session readiness and the first output/playback events
+also produce content-free logs. The summary's `isOwner` field means number
+recognition only. A first audio packet can contain silence, and a playback mark
+does not prove a human heard the greeting.
+
+Earlier caller testing confirmed web search and code inspection. The latest startup
+and pacing changes have not been verified in a real phone call; faster audible
+startup and slower speech remain to be checked by listening. Offline tests establish
+bridge behavior, not provider availability or listening quality.
 
 ## Files
 
 - `src/server.js`: signed HTTP routes, TwiML, executable entry point.
-- `src/callSecurity.js`: signature checks, owner verification, ephemeral stream grants.
-- `src/realtimeHandler.js`: Live/Twilio bridge, keypad owner verification, and session/tool lifecycle.
+- `src/callSecurity.js`: signature checks, number recognition, ephemeral stream grants.
+- `src/realtimeHandler.js`: Live/Twilio bridge, startup timing, and session/tool lifecycle.
 - `src/assistantConfig.js`: voice/backend prompts, session configuration, tool contracts.
 - `src/codebaseData.js`: constrained source inspection.
 - `test/`: offline unit and mocked/loopback integration tests.

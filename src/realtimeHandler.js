@@ -1,6 +1,6 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import { randomUUID } from 'node:crypto';
-import { buildLiveSession, executeCodeTool, OWNER_GREETING, OWNER_PIN_GREETING, PUBLIC_GREETING } from './assistantConfig.js';
+import { buildLiveSession, executeCodeTool } from './assistantConfig.js';
 
 const LIVE_ENDPOINT = 'wss://api.openai.com/v1/live/sessions';
 const PROVIDER_ERROR_CODES = new Set([
@@ -17,8 +17,7 @@ const DEFAULT_LIMITS = {
   closeTimeoutMs: 15_000,
   toolTimeoutMs: 10_000,
   backendTimeoutMs: 30_000,
-  ownerPinTimeoutMs: 30_000,
-  ownerUpdateTimeoutMs: 10_000,
+  maxPendingConnections: 8,
   maxCallMs: 30 * 60_000,
   maxBackendResponses: 24,
   maxCustomCalls: 24,
@@ -41,7 +40,7 @@ const audioBytes = (payload) => {
   return Buffer.from(payload, 'base64').length;
 };
 
-// The caller and tool permissions come from a single-use, verified call grant.
+// Caller recognition comes from a single-use, verified call grant.
 // Live owns turn taking: input and output remain independent continuous streams.
 export function attachLiveCall(socket, {
   security,
@@ -50,8 +49,12 @@ export function attachLiveCall(socket, {
   logger = console,
   limits: overrides = {},
   onFinish = () => {},
+  onVerifiedStart = () => {},
+  now = () => performance.now(),
 } = {}) {
   const limits = { ...DEFAULT_LIMITS, ...overrides };
+  const connectedAt = now();
+  const elapsed = () => Math.round(Math.max(0, now() - connectedAt));
   let live = null;
   let streamSid = null;
   let started = false;
@@ -59,11 +62,6 @@ export function attachLiveCall(socket, {
   let closing = false;
   let finished = false;
   let isOwner = false;
-  let ownerVerificationPending = false;
-  let pinInput = '';
-  let ownerPinTimer = null;
-  let ownerUpdateTimer = null;
-  let ownerUpdate = null;
   let closeTimer = null;
   let callTimer = null;
   let queuedAudioBytes = 0;
@@ -75,6 +73,7 @@ export function attachLiveCall(socket, {
   const responses = new Map();
   const delegationResponses = new Map();
   const seenCalls = new Set();
+  const commands = new Map();
   const abortController = new AbortController();
   const summary = {
     sessionId: null,
@@ -84,6 +83,16 @@ export function attachLiveCall(socket, {
     usageFinalized: false,
     customCalls: 0,
     playedAudioBytes: 0,
+    timings: {
+      providerConnectMs: null,
+      phoneStartMs: null,
+      providerOpenMs: null,
+      sessionStartSentMs: null,
+      sessionReadyMs: null,
+      firstInputAudioMs: null,
+      firstOutputAudioMs: null,
+      firstPlaybackAckMs: null,
+    },
     backend: { responses: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
   };
 
@@ -97,7 +106,13 @@ export function attachLiveCall(socket, {
       return false;
     }
   };
-  const command = (event) => send(live, { event_id: randomUUID(), ...event });
+  const command = (event) => {
+    const eventId = randomUUID();
+    if (!send(live, { event_id: eventId, ...event })) return false;
+    commands.set(eventId, event.type);
+    if (commands.size > 128) commands.delete(commands.keys().next().value);
+    return true;
+  };
   const closeSocket = (target) => {
     if (!target || target.readyState === WebSocket.CLOSED) return;
     try { target.close(); } catch { target.terminate?.(); }
@@ -116,13 +131,11 @@ export function attachLiveCall(socket, {
     clearTimeout(closeTimer);
     clearTimeout(callTimer);
     clearTimeout(continuationTimer);
-    clearTimeout(ownerPinTimer);
-    clearTimeout(ownerUpdateTimer);
-    pinInput = '';
     for (const batch of responses.values()) clearTimeout(batch.timer);
     responses.clear();
     delegationResponses.clear();
     seenCalls.clear();
+    commands.clear();
     marks.clear();
     closeSocket(live);
     closeSocket(socket);
@@ -137,9 +150,6 @@ export function attachLiveCall(socket, {
     clearTimeout(startTimer);
     clearTimeout(callTimer);
     clearTimeout(continuationTimer);
-    clearTimeout(ownerPinTimer);
-    clearTimeout(ownerUpdateTimer);
-    pinInput = '';
     for (const batch of responses.values()) clearTimeout(batch.timer);
     clearPlayback();
     closeSocket(socket);
@@ -157,18 +167,11 @@ export function attachLiveCall(socket, {
   const startTimer = setTimeout(() => close('startup_timeout'), limits.startTimeoutMs);
   startTimer.unref?.();
 
-  const verifyOwner = (verified) => {
-    clearTimeout(ownerPinTimer);
-    pinInput = '';
-    ownerUpdate = { eventId: randomUUID(), isOwner: verified };
-    const { instructions, tools, tool_choice } = buildLiveSession({ isOwner: verified }).delegation.responses;
-    // Both outcomes replace the pending backend instructions. Tools stay
-    // disabled locally until the matching provider acknowledgment.
-    if (!send(live, { type: 'session.update', event_id: ownerUpdate.eventId,
-      session: { delegation: { type: 'responses', responses: { instructions, tools, tool_choice } } },
-    })) return close('owner_update_failed');
-    ownerUpdateTimer = setTimeout(() => close('owner_update_timeout'), limits.ownerUpdateTimeoutMs);
-    ownerUpdateTimer.unref?.();
+  const maybeStartSession = () => {
+    if (closing || startSent || !streamSid || live?.readyState !== WebSocket.OPEN) return;
+    summary.timings.sessionStartSentMs = elapsed();
+    startSent = command({ type: 'session.start', session: buildLiveSession({ isOwner }) });
+    if (!startSent) close('session_start_failed');
   };
 
   const updateVoiceUsage = (usage) => {
@@ -186,41 +189,37 @@ export function attachLiveCall(socket, {
       summary.customCalls += 1;
       if (summary.customCalls > limits.maxCustomCalls) return close('tool_budget_exceeded');
       let result;
-      if (!isOwner) {
-        result = { ok: false, reason: 'unauthorized' };
-      } else {
-        let args;
+      let args;
+      try {
+        if (typeof item.arguments !== 'string' || item.arguments.length > 8192) throw new Error();
+        args = JSON.parse(item.arguments);
+        if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error();
+      } catch {
+        result = { ok: false, reason: 'invalid_arguments' };
+      }
+      if (!result) {
+        const toolAbort = new AbortController();
+        const signal = AbortSignal.any([abortController.signal, toolAbort.signal]);
+        let timeout;
+        const cancellation = new Promise((resolve) => {
+          signal.addEventListener('abort', () => resolve({ ok: false, reason: 'cancelled' }), { once: true });
+        });
         try {
-          if (typeof item.arguments !== 'string' || item.arguments.length > 8192) throw new Error();
-          args = JSON.parse(item.arguments);
-          if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error();
+          result = await Promise.race([
+            Promise.resolve().then(() => executeTool(item.name, args, { signal })),
+            new Promise((resolve) => {
+              timeout = setTimeout(() => {
+                resolve({ ok: false, reason: 'tool_timeout' });
+                toolAbort.abort();
+              }, limits.toolTimeoutMs);
+            }),
+            cancellation,
+          ]);
         } catch {
-          result = { ok: false, reason: 'invalid_arguments' };
-        }
-        if (!result) {
-          const toolAbort = new AbortController();
-          const signal = AbortSignal.any([abortController.signal, toolAbort.signal]);
-          let timeout;
-          const cancellation = new Promise((resolve) => {
-            signal.addEventListener('abort', () => resolve({ ok: false, reason: 'cancelled' }), { once: true });
-          });
-          try {
-            result = await Promise.race([
-              Promise.resolve().then(() => executeTool(item.name, args, { isOwner, signal })),
-              new Promise((resolve) => {
-                timeout = setTimeout(() => {
-                  resolve({ ok: false, reason: 'tool_timeout' });
-                  toolAbort.abort();
-                }, limits.toolTimeoutMs);
-              }),
-              cancellation,
-            ]);
-          } catch {
-            result = { ok: false, reason: 'tool_failed' };
-          } finally {
-            clearTimeout(timeout);
-            toolAbort.abort();
-          }
+          result = { ok: false, reason: 'tool_failed' };
+        } finally {
+          clearTimeout(timeout);
+          toolAbort.abort();
         }
       }
       if (closing) return;
@@ -313,30 +312,15 @@ export function attachLiveCall(socket, {
       }
       if (event.type === 'session.started') {
         if (started) return;
+        if (!startSent) return close('unexpected_session_start');
         started = true;
         summary.sessionId = event.session?.id || null;
         if (closing) return command({ type: 'session.close' });
+        summary.timings.sessionReadyMs = elapsed();
         clearTimeout(startTimer);
         callTimer = setTimeout(() => close('call_duration_limit'), limits.maxCallMs);
         callTimer.unref?.();
-        if (ownerVerificationPending) {
-          ownerPinTimer = setTimeout(() => verifyOwner(false), limits.ownerPinTimeoutMs);
-          ownerPinTimer.unref?.();
-        }
-        logger.info('[Live] session ready', { sessionId: summary.sessionId, isOwner, ownerVerificationPending });
-      } else if (!closing && ownerUpdate && event.type === 'session.updated'
-        && event.client_event_id === ownerUpdate.eventId) {
-        clearTimeout(ownerUpdateTimer);
-        isOwner = ownerUpdate.isOwner;
-        ownerUpdate = null;
-        ownerVerificationPending = false;
-        summary.isOwner = isOwner;
-        if (!command({ type: 'session.instructions.append', delegation_id: null,
-          content: isOwner
-            ? 'The server has verified the owner PIN. You are now speaking directly with Tom; address him as you and your. Public web search and read-only inspection of this running service are now authorized. Do not request or repeat a PIN. Say: Hey Tom, you are all set. What is on your mind? Then listen. Delegate current facts and authorized tool requests to the backend.'
-            : 'Server verification is finished without owner access. Private tools remain unavailable for this call. Do not ask for another PIN. Say: We can keep chatting without private tools. How can I help? Continue with public caller permissions.',
-        })) return close('owner_update_failed');
-        if (isOwner) logger.info('[Live] owner access enabled');
+        logger.info('[Live] session ready', { sessionId: summary.sessionId, isOwner, timings: structuredClone(summary.timings) });
       } else if (event.type === 'session.usage.updated') {
         updateVoiceUsage(event.usage);
       } else if (!closing && event.type === 'session.output_audio.delta') {
@@ -345,6 +329,10 @@ export function attachLiveCall(socket, {
         if (queuedAudioBytes + bytes > limits.maxQueuedAudioMs * 8) return close('playback_backlog');
         const name = `live-${++markSequence}`;
         if (!send(socket, { event: 'media', streamSid, media: { payload: event.delta } })) return close('output_delivery_failed');
+        if (summary.timings.firstOutputAudioMs === null) {
+          summary.timings.firstOutputAudioMs = elapsed();
+          logger.info('[Live] first output audio', { sessionId: summary.sessionId, elapsedMs: summary.timings.firstOutputAudioMs });
+        }
         marks.set(name, bytes);
         queuedAudioBytes += bytes;
         if (!send(socket, { event: 'mark', streamSid, mark: { name } })) close('playback_tracking_failed');
@@ -357,7 +345,7 @@ export function attachLiveCall(socket, {
         logger.warn('[Live] provider rejected a command', {
           code: PROVIDER_ERROR_CODES.has(event.error?.code) ? event.error.code : 'unknown',
           parameter: PROVIDER_ERROR_PARAMS.has(event.error?.param) ? event.error.param : 'unknown',
-          command: ownerUpdate && clientEventId === ownerUpdate.eventId ? 'session.update' : 'unknown',
+          command: commands.get(clientEventId) || 'unknown',
         });
         close('provider_error');
       }
@@ -381,29 +369,12 @@ export function attachLiveCall(socket, {
         });
         if (!grant || !event.start.streamSid) return close('unauthorized_stream');
         streamSid = event.start.streamSid;
+        summary.timings.phoneStartMs = elapsed();
         isOwner = grant.isOwner === true;
-        ownerVerificationPending = !isOwner && grant.ownerVerificationPending === true;
         summary.isOwner = isOwner;
-        // Untrusted custom caller numbers and caller-provided roles are ignored.
-        live = connectLive({ isOwner });
-        live.on('message', handleLiveMessage);
-        live.on('error', () => close('provider_connection_failed'));
-        live.on('close', () => {
-          if (!finished) {
-            summary.reason ||= 'provider_connection_closed';
-            clearPlayback();
-            finish();
-          }
-        });
-        live.on('open', () => {
-          if (closing) return closeSocket(live);
-          const session = buildLiveSession({ isOwner, ownerVerificationPending });
-          const greeting = ownerVerificationPending ? OWNER_PIN_GREETING : isOwner ? OWNER_GREETING : PUBLIC_GREETING;
-          session.input = [{ type: 'message', role: 'developer', content: [{ type: 'input_text',
-            text: `Speak English. Greet the caller first with exactly: ${greeting} Then listen.` }] }];
-          startSent = command({ type: 'session.start', session });
-          if (!startSent) close('session_start_failed');
-        });
+        onVerifiedStart();
+        // Caller-number and role custom parameters cannot alter the greeting.
+        maybeStartSession();
       } else if (event.event === 'media') {
         if (!streamSid || !live || (event.streamSid && event.streamSid !== streamSid)) return close('invalid_stream_media');
         const payload = event.media?.payload;
@@ -413,20 +384,8 @@ export function attachLiveCall(socket, {
         // Listening begins when Live is ready. Never accumulate setup audio or
         // replay it in a burst: Live requires a continuous, realtime input pace.
         if (!started) return;
-        // Keep the timeline moving so Marin can speak, while keeping keypad
-        // tones and any accidentally spoken PIN out of the model's audio.
-        const audio = ownerVerificationPending ? Buffer.alloc(bytes, 0xff).toString('base64') : payload;
-        if (!send(live, { type: 'session.input_audio.append', audio })) close('input_delivery_failed');
-      } else if (event.event === 'dtmf') {
-        if (!started || !ownerVerificationPending || ownerUpdate
-          || event.streamSid !== streamSid || event.dtmf?.track !== 'inbound') return;
-        const digit = event.dtmf.digit;
-        if (digit === '#') verifyOwner(security.verifyOwnerPin(pinInput) === true);
-        else if (digit === '*') verifyOwner(false);
-        else if (typeof digit === 'string' && /^\d$/.test(digit)) {
-          if (pinInput.length >= 12) verifyOwner(false);
-          else pinInput += digit;
-        }
+        if (!send(live, { type: 'session.input_audio.append', audio: payload })) return close('input_delivery_failed');
+        summary.timings.firstInputAudioMs ??= elapsed();
       } else if (event.event === 'mark') {
         if (!marks.has(event.mark?.name)) return;
         for (const [name, bytes] of marks) {
@@ -434,6 +393,10 @@ export function attachLiveCall(socket, {
           queuedAudioBytes -= bytes;
           summary.playedAudioBytes += bytes;
           if (name === event.mark.name) break;
+        }
+        if (summary.timings.firstPlaybackAckMs === null) {
+          summary.timings.firstPlaybackAckMs = elapsed();
+          logger.info('[Live] first playback acknowledged', { sessionId: summary.sessionId, elapsedMs: summary.timings.firstPlaybackAckMs });
         }
       } else if (event.event === 'stop') {
         close('caller_stopped');
@@ -446,12 +409,39 @@ export function attachLiveCall(socket, {
   socket.on('message', handleTwilioMessage);
   socket.on('close', () => close('caller_disconnected'));
   socket.on('error', () => close('call_connection_failed'));
+  try {
+    // attachLiveServer has already verified the Twilio upgrade. Overlap the
+    // provider's transport handshake with receipt of the call's stream grant.
+    // This does not start a Live session until maybeStartSession validates it.
+    summary.timings.providerConnectMs = elapsed();
+    live = connectLive({});
+    live.on('message', handleLiveMessage);
+    live.on('error', () => close('provider_connection_failed'));
+    live.on('close', () => {
+      if (!finished) {
+        summary.reason ||= 'provider_connection_closed';
+        clearPlayback();
+        finish();
+      }
+    });
+    const opened = () => {
+      if (closing) return closeSocket(live);
+      summary.timings.providerOpenMs ??= elapsed();
+      maybeStartSession();
+    };
+    live.on('open', opened);
+    if (live.readyState === WebSocket.OPEN) opened();
+  } catch {
+    close('provider_connection_failed');
+  }
   return { close, getSummary: () => structuredClone(summary) };
 }
 
 export function attachLiveServer(server, { security, streamUrl, apiKey, connectLive, logger = console, limits } = {}) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024, perMessageDeflate: false });
   const calls = new Set();
+  const pendingLimit = limits?.maxPendingConnections ?? DEFAULT_LIMITS.maxPendingConnections;
+  let pendingConnections = 0;
   const path = new URL(streamUrl).pathname;
   server.on('upgrade', (request, socket, head) => {
     // Twilio signs the wss:// URL from the TwiML, not its HTTPS equivalent.
@@ -467,19 +457,44 @@ export function attachLiveServer(server, { security, streamUrl, apiKey, connectL
       socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n', () => socket.destroy());
       return;
     }
-    wss.handleUpgrade(request, socket, head, (connection) => {
-      wss.emit('connection', connection);
-    });
+    if (pendingConnections >= pendingLimit) {
+      socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n', () => socket.destroy());
+      return;
+    }
+    pendingConnections += 1;
+    let pending = true;
+    const releasePending = () => {
+      if (!pending) return;
+      pending = false;
+      pendingConnections -= 1;
+      socket.off('close', releasePending);
+    };
+    socket.once('close', releasePending);
+    try {
+      wss.handleUpgrade(request, socket, head, (connection) => {
+        wss.emit('connection', connection, releasePending);
+      });
+    } catch {
+      releasePending();
+      socket.destroy();
+    }
   });
-  wss.on('connection', (socket) => {
-    const call = attachLiveCall(socket, {
+  wss.on('connection', (socket, releasePending) => {
+    let call = null;
+    let finished = false;
+    call = attachLiveCall(socket, {
       security,
       connectLive: connectLive || (() => connectToLive({ apiKey })),
       logger,
       limits,
-      onFinish: () => calls.delete(call),
+      onVerifiedStart: releasePending,
+      onFinish: () => {
+        finished = true;
+        releasePending();
+        calls.delete(call);
+      },
     });
-    calls.add(call);
+    if (!finished) calls.add(call);
   });
   // Start draining before HTTP waits for upgraded connections to close.
   const closeHttpServer = server.close.bind(server);

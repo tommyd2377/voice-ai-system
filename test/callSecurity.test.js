@@ -50,9 +50,7 @@ test('stream grants preserve verified caller identity, bind CallSid, and cannot 
   assert.equal(security.consumeGrant({ token, callSid: otherCallSid }), null);
   assert.deepEqual(security.consumeGrant({ token, callSid, callerPhone: '+12025550125' }), {
     callerPhone: ownerPhone,
-    isOwnerCandidate: true,
-    isOwner: false,
-    ownerVerificationPending: false,
+    isOwner: true,
   });
   assert.equal(security.consumeGrant({ token, callSid }), null);
   assert.equal(security.consumeGrant({ token: 'forged', callSid }), null);
@@ -72,9 +70,7 @@ test('stream grants expire after 60 seconds and unused grants have bounded stora
   assert.equal(security.consumeGrant({ token: oldest, callSid }), null);
   assert.deepEqual(security.consumeGrant({ token: newest, callSid }), {
     callerPhone: null,
-    isOwnerCandidate: false,
     isOwner: false,
-    ownerVerificationPending: false,
   });
 });
 
@@ -82,64 +78,28 @@ test('owner matching normalizes US phones without matching an unrelated country 
   const security = createCallSecurity({ authToken, ownerPhone: '1 (202) 555-0123' });
   for (const phone of [ownerPhone, '2025550123', '1-202-555-0123']) {
     const token = security.issueGrant({ callSid, callerPhone: phone });
-    assert.equal(security.consumeGrant({ token, callSid }).isOwnerCandidate, true);
+    assert.equal(security.consumeGrant({ token, callSid }).isOwner, true);
   }
   for (const phone of ['+442025550123', '+992025550123', 'anonymous', '2025550123 ext 1']) {
     const token = security.issueGrant({ callSid, callerPhone: phone });
-    assert.equal(security.consumeGrant({ token, callSid }).isOwnerCandidate, false);
+    assert.equal(security.consumeGrant({ token, callSid }).isOwner, false);
   }
   const international = createCallSecurity({ authToken, ownerPhone: '+44 20 7946 0123' });
   const token = international.issueGrant({ callSid, callerPhone: '+442079460123' });
-  assert.equal(international.consumeGrant({ token, callSid }).isOwnerCandidate, true);
+  assert.equal(international.consumeGrant({ token, callSid }).isOwner, true);
 });
 
-test('owner PIN requires configured 4–12 digits and rejects missing, malformed, and wrong inputs', () => {
-  const security = createCallSecurity({ authToken, ownerPin: '04231' });
-  assert.equal(security.verifyOwnerPin('04231'), true);
-  for (const pin of ['04232', '0423', ' 04231', 4231, undefined, '04231#', '1'.repeat(13)]) {
-    assert.equal(security.verifyOwnerPin(pin), false);
-  }
-  for (const ownerPin of [undefined, '', '123', '1'.repeat(13), '123a', 1234]) {
-    assert.equal(createCallSecurity({ authToken, ownerPin }).verifyOwnerPin('1234'), false);
-  }
-});
-
-test('owner access requires both the matching signed caller and server-verified PIN state', () => {
-  const security = createCallSecurity({ authToken, ownerPhone, ownerPin: '04231' });
-  assert.equal(security.canVerifyOwner, true);
+test('greeting recognition uses the signed caller phone and remains optional', () => {
+  const security = createCallSecurity({ authToken, ownerPhone });
   assert.equal(security.isOwnerPhone('2025550123'), true);
   assert.equal(security.isOwnerPhone('+442025550123'), false);
-  const ownerToken = security.issueGrant({ callSid, callerPhone: ownerPhone, ownerVerified: true });
+  const ownerToken = security.issueGrant({ callSid, callerPhone: ownerPhone });
   assert.equal(security.consumeGrant({ token: ownerToken, callSid }).isOwner, true);
-  const publicToken = security.issueGrant({ callSid, callerPhone: '+12025550125', ownerVerified: true });
+  const publicToken = security.issueGrant({ callSid, callerPhone: '+12025550125' });
   assert.equal(security.consumeGrant({ token: publicToken, callSid }).isOwner, false);
-  const unverifiedToken = security.issueGrant({ callSid, callerPhone: ownerPhone });
-  assert.equal(security.consumeGrant({ token: unverifiedToken, callSid }).isOwner, false);
-  for (const configuration of [{ authToken, ownerPhone }, { authToken, ownerPin: '04231' }, {}]) {
-    const disabled = createCallSecurity(configuration);
-    assert.equal(disabled.canVerifyOwner, false);
-    if (configuration.authToken) {
-      const token = disabled.issueGrant({ callSid, callerPhone: ownerPhone, ownerVerified: true });
-      assert.equal(disabled.consumeGrant({ token, callSid }).isOwner, false);
-    }
+  for (const configuredPhone of [undefined, '', 'not-a-phone']) {
+    const unconfigured = createCallSecurity({ authToken, ownerPhone: configuredPhone });
+    const token = unconfigured.issueGrant({ callSid, callerPhone: ownerPhone });
+    assert.deepEqual(unconfigured.consumeGrant({ token, callSid }), { callerPhone: ownerPhone, isOwner: false });
   }
-});
-
-test('owner verification is pending only for an explicitly requested eligible unverified caller', () => {
-  const security = createCallSecurity({ authToken, ownerPhone, ownerPin: '04231' });
-  for (const [options, expectedPending, expectedOwner] of [
-    [{ callerPhone: ownerPhone }, false, false],
-    [{ callerPhone: ownerPhone, requestOwnerVerification: true }, true, false],
-    [{ callerPhone: ownerPhone, requestOwnerVerification: 'true' }, false, false],
-    [{ callerPhone: '+12025550125', requestOwnerVerification: true }, false, false],
-    [{ callerPhone: ownerPhone, requestOwnerVerification: true, ownerVerified: true }, false, true],
-  ]) {
-    const token = security.issueGrant({ callSid, ...options });
-    const grant = security.consumeGrant({ token, callSid });
-    assert.equal(grant.ownerVerificationPending, expectedPending);
-    assert.equal(grant.isOwner, expectedOwner);
-  }
-  const unconfigured = createCallSecurity({ authToken, ownerPhone });
-  const token = unconfigured.issueGrant({ callSid, callerPhone: ownerPhone, requestOwnerVerification: true });
-  assert.equal(unconfigured.consumeGrant({ token, callSid }).ownerVerificationPending, false);
 });

@@ -25,7 +25,6 @@ test('health identifies deployed models, revision and configuration without expo
     TWILIO_AUTH_TOKEN: 'fake-twilio-credential',
     TWILIO_STREAM_URL: 'wss://voice.example.test/realtime',
     TWILIO_OWNER_PHONE: '+12025550123',
-    TWILIO_OWNER_PIN: 'fake-pin',
     RAILWAY_GIT_COMMIT_SHA: 'a'.repeat(40),
   };
   const result = await health(t, env);
@@ -34,11 +33,11 @@ test('health identifies deployed models, revision and configuration without expo
   assert.equal(result.body.backendModel, 'gpt-6-luna');
   assert.equal(result.body.revision, env.RAILWAY_GIT_COMMIT_SHA);
   assert.equal(result.body.configurationReady, true);
-  assert.equal(result.body.ownerToolsConfigured, false);
+  assert.equal(result.body.toolsAvailable, true);
+  assert.equal(result.body.ownerRecognitionConfigured, true);
   assert.deepEqual(result.body.missingConfiguration, []);
-  assert.deepEqual(result.body.missingOwnerConfiguration, ['TWILIO_OWNER_PIN']);
   const output = JSON.stringify(result.body);
-  for (const name of ['OPENAI_API_KEY', 'TWILIO_AUTH_TOKEN', 'TWILIO_OWNER_PHONE', 'TWILIO_OWNER_PIN', 'TWILIO_STREAM_URL']) {
+  for (const name of ['OPENAI_API_KEY', 'TWILIO_AUTH_TOKEN', 'TWILIO_OWNER_PHONE', 'TWILIO_STREAM_URL']) {
     assert.equal(output.includes(env[name]), false);
   }
 });
@@ -47,7 +46,7 @@ test('health reports exact missing variable names without starting a voice sessi
   const result = await health(t, {});
   assert.equal(result.body.configurationReady, false);
   assert.deepEqual(result.body.missingConfiguration, ['TWILIO_STREAM_URL', 'TWILIO_AUTH_TOKEN', 'OPENAI_API_KEY']);
-  assert.deepEqual(result.body.missingOwnerConfiguration, ['TWILIO_OWNER_PHONE', 'TWILIO_OWNER_PIN']);
-  assert.equal(result.body.ownerToolsConfigured, false);
+  assert.equal(result.body.ownerRecognitionConfigured, false);
+  assert.equal(result.body.toolsAvailable, true);
   assert.equal(result.body.revision, null);
 });

@@ -5,6 +5,7 @@ import test from 'node:test';
 import twilio from 'twilio';
 import WebSocket from 'ws';
 import { createVoiceServer } from '../src/server.js';
+import { OWNER_GREETING, PUBLIC_GREETING } from '../src/assistantConfig.js';
 
 const publicOrigin = 'https://voice.example.test';
 const authToken = 'fake-twilio-token-for-tests';
@@ -12,6 +13,7 @@ const ownerPhone = '+12025550123';
 const publicPhone = '+12025550124';
 const callSid = `CA${'a'.repeat(32)}`;
 const streamSid = `MZ${'b'.repeat(32)}`;
+const expectedTools = ['web_search', 'get_codebase_overview', 'search_codebase', 'read_code_snippet'];
 
 class FakeLiveSocket extends EventEmitter {
   constructor(onStart) {
@@ -43,22 +45,6 @@ class FakeLiveSocket extends EventEmitter {
           this.emit('message', JSON.stringify({ type: 'session.closed', usage: { seconds: 0 } }));
         }
       });
-    } else if (command.type === 'session.update') {
-      if (command.session?.delegation?.type !== 'responses') {
-        queueMicrotask(() => this.emit('message', JSON.stringify({
-          type: 'error',
-          error: { code: 'invalid_request_error', param: 'session.delegation.type' },
-        })));
-        return;
-      }
-      this.emit('updateRequested', command);
-      queueMicrotask(() => {
-        if (this.readyState === WebSocket.OPEN) {
-          const acknowledgment = { type: 'session.updated', client_event_id: command.event_id };
-          this.emit('message', JSON.stringify(acknowledgment));
-          this.emit('updated', acknowledgment);
-        }
-      });
     } else if (command.type === 'session.input_audio.append') {
       this.emit('inputAudio', command);
     }
@@ -73,7 +59,7 @@ class FakeLiveSocket extends EventEmitter {
   terminate() { this.close(); }
 }
 
-async function harness(t, envOverrides = {}) {
+async function harness(t, envOverrides = {}, limitOverrides = {}) {
   const events = new EventEmitter();
   const clients = [];
   const providers = [];
@@ -82,7 +68,6 @@ async function harness(t, envOverrides = {}) {
     TWILIO_STREAM_URL: `${publicOrigin.replace('https:', 'wss:')}/realtime`,
     TWILIO_AUTH_TOKEN: authToken,
     TWILIO_OWNER_PHONE: ownerPhone,
-    TWILIO_OWNER_PIN: '04231',
     OPENAI_API_KEY: 'fake-openai-key-never-sent',
     ...envOverrides,
   };
@@ -93,12 +78,12 @@ async function harness(t, envOverrides = {}) {
       warn: (...args) => logs.push(args),
       error: (...args) => logs.push(args),
     },
-    connectLive: ({ isOwner }) => {
-      const provider = new FakeLiveSocket((session) => events.emit('started', { isOwner, session }));
+    connectLive: () => {
+      const provider = new FakeLiveSocket((session) => events.emit('started', { session }));
       providers.push(provider);
       return provider;
     },
-    limits: { startTimeoutMs: 1000, closeTimeoutMs: 50, maxCallMs: 2000 },
+    limits: { startTimeoutMs: 1000, closeTimeoutMs: 50, maxCallMs: 2000, ...limitOverrides },
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -145,10 +130,7 @@ async function harness(t, envOverrides = {}) {
     return socket;
   }
 
-  async function startStream(token, customParameters = {}) {
-    const socket = websocket();
-    const closed = new Promise((resolve) => socket.once('close', resolve));
-    await once(socket, 'open', { signal: AbortSignal.timeout(1000) });
+  function sendStart(socket, token, customParameters = {}) {
     socket.send(JSON.stringify({
       event: 'start',
       start: {
@@ -158,10 +140,17 @@ async function harness(t, envOverrides = {}) {
         customParameters: { grantToken: token, ...customParameters },
       },
     }));
+  }
+
+  async function startStream(token, customParameters = {}) {
+    const socket = websocket();
+    const closed = new Promise((resolve) => socket.once('close', resolve));
+    await once(socket, 'open', { signal: AbortSignal.timeout(1000) });
+    sendStart(socket, token, customParameters);
     return { socket, closed };
   }
 
-  return { post, websocket, startStream, providers, events, logs, server };
+  return { post, websocket, startStream, sendStart, providers, events, logs, server };
 }
 
 const grantFrom = (response) => {
@@ -172,8 +161,14 @@ const grantFrom = (response) => {
   return match[1];
 };
 const started = (events) => once(events, 'started', { signal: AbortSignal.timeout(1000) });
+const assertSession = (session, isOwner) => {
+  const initialInstruction = session.input[0].content[0].text;
+  assert.equal(initialInstruction.includes(isOwner ? OWNER_GREETING : PUBLIC_GREETING), true);
+  assert.equal(initialInstruction.includes(isOwner ? PUBLIC_GREETING : OWNER_GREETING), false);
+  assert.deepEqual(session.delegation.responses.tools.map((tool) => tool.name || tool.type), expectedTools);
+};
 
-test('signed public webhook issues a grant and spoofed stream parameters cannot enable private tools', async (t) => {
+test('signed public callers get shared tools while forged stream identity cannot change their greeting', async (t) => {
   const app = await harness(t);
   const response = await app.post('/voice', { CallSid: callSid, From: publicPhone });
   assert.match(response.headers['content-type'], /text\/xml/);
@@ -182,25 +177,24 @@ test('signed public webhook issues a grant and spoofed stream parameters cannot 
   assert.match(response.text, /<\/Connect><Hangup\/>/);
   const sessionPromise = started(app.events);
   await app.startStream(grantFrom(response), {
-    customerPhone: ownerPhone, isOwner: 'true', ownerVerified: 'true', ownerVerificationPending: 'true',
+    customerPhone: ownerPhone, isOwner: 'true',
   });
-  const [{ isOwner, session }] = await sessionPromise;
-  assert.equal(isOwner, false);
+  const [{ session }] = await sessionPromise;
   assert.equal(session.model, 'gpt-live-1');
-  assert.deepEqual(session.delegation.responses.tools, []);
+  assertSession(session, false);
 });
 
 test('unsigned HTTP requests are forbidden before a provider can start', async (t) => {
   const app = await harness(t);
   for (const path of ['/voice', '/voice/owner', '/voice/public']) {
-    const response = await app.post(path, { CallSid: callSid, From: ownerPhone, Digits: '04231' }, false);
+    const response = await app.post(path, { CallSid: callSid, From: ownerPhone }, false);
     assert.equal(response.status, 403);
     assert.doesNotMatch(response.text, /grantToken|<Gather/);
   }
   assert.equal(app.providers.length, 0);
 });
 
-test('signed owner caller connects directly to Victoria without gaining private tools before verification', async (t) => {
+test('recognized callers get a personal greeting and the same tools without an extra step', async (t) => {
   const app = await harness(t);
   const response = await app.post('/voice', { CallSid: callSid, From: ownerPhone });
   assert.equal(response.status, 200);
@@ -209,110 +203,115 @@ test('signed owner caller connects directly to Victoria without gaining private 
   assert.equal(app.providers.length, 0);
   const sessionPromise = started(app.events);
   await app.startStream(grantFrom(response));
-  const [{ isOwner, session }] = await sessionPromise;
-  assert.equal(isOwner, false);
-  assert.deepEqual(session.delegation.responses.tools, []);
+  const [{ session }] = await sessionPromise;
+  assertSession(session, true);
 });
 
-test('signed owner call enables private tools after keypad verification and the matching Live update acknowledgment', async (t) => {
+test('the Live transport can open early but starts its session only after the signed call grant arrives', async (t) => {
   const app = await harness(t);
   const response = await app.post('/voice', { CallSid: callSid, From: ownerPhone });
-  const sessionPromise = started(app.events);
-  const client = await app.startStream(grantFrom(response));
-  const [{ isOwner, session }] = await sessionPromise;
-  assert.equal(isOwner, false);
-  assert.deepEqual(session.delegation.responses.tools, []);
-  assert.equal(app.logs.find(([message]) => message === '[Live] session ready')[1].ownerVerificationPending, true);
+  const socket = app.websocket();
+  await once(socket, 'open', { signal: AbortSignal.timeout(1000) });
+  assert.equal(app.providers.length, 1);
   const provider = app.providers[0];
-  let ownerEnabledBeforeAcknowledgment;
-  provider.once('updateRequested', () => {
-    ownerEnabledBeforeAcknowledgment = app.logs.some(([message]) => message === '[Live] owner access enabled');
-  });
-  const updateRequested = once(provider, 'updateRequested', { signal: AbortSignal.timeout(1000) });
-  const updated = once(provider, 'updated', { signal: AbortSignal.timeout(1000) });
-  for (const digit of '04231#') {
-    client.socket.send(JSON.stringify({ event: 'dtmf', streamSid, dtmf: { track: 'inbound', digit } }));
+  if (provider.readyState !== WebSocket.OPEN) {
+    await once(provider, 'open', { signal: AbortSignal.timeout(1000) });
   }
-  const [update] = await updateRequested;
-  assert.equal(ownerEnabledBeforeAcknowledgment, false);
-  assert.deepEqual(update.session.delegation.responses.tools.map((tool) => tool.name || tool.type), [
-    'web_search', 'get_codebase_overview', 'search_codebase', 'read_code_snippet',
-  ]);
-  const [acknowledgment] = await updated;
-  assert.equal(acknowledgment.client_event_id, update.event_id);
-  assert.equal(app.logs.filter(([message]) => message === '[Live] owner access enabled').length, 1);
-  assert.equal(app.providers.length, 1);
-  assert.equal(provider.commands.filter((command) => command.type === 'session.start').length, 1);
-  assert.equal(provider.commands.filter((command) => command.type === 'session.update').length, 1);
-  assert.equal(JSON.stringify({ commands: provider.commands, logs: app.logs }).includes('04231'), false);
-});
-
-test('star skips owner verification and resumes public conversation with unchanged phone audio', async (t) => {
-  const app = await harness(t);
-  const response = await app.post('/voice', { CallSid: callSid, From: ownerPhone });
+  assert.deepEqual(provider.commands, []);
   const sessionPromise = started(app.events);
-  const client = await app.startStream(grantFrom(response));
-  await sessionPromise;
-  const provider = app.providers[0];
-  const updateRequested = once(provider, 'updateRequested', { signal: AbortSignal.timeout(1000) });
-  const updated = once(provider, 'updated', { signal: AbortSignal.timeout(1000) });
-  client.socket.send(JSON.stringify({ event: 'dtmf', streamSid, dtmf: { track: 'inbound', digit: '*' } }));
-  const [update] = await updateRequested;
-  assert.equal(update.session.delegation.type, 'responses');
-  assert.deepEqual(update.session.delegation.responses.tools, []);
-  assert.equal(update.session.delegation.responses.tool_choice, 'none');
-  const [acknowledgment] = await updated;
-  assert.equal(acknowledgment.client_event_id, update.event_id);
-  const continuation = provider.commands.find((command) => command.type === 'session.instructions.append');
-  assert.match(continuation.content, /Continue with public caller permissions/);
-
-  const payload = Buffer.from(Array.from({ length: 160 }, (_, index) => index % 128)).toString('base64');
-  assert.notEqual(payload, Buffer.alloc(160, 0xff).toString('base64'));
-  const audioForwarded = once(provider, 'inputAudio', { signal: AbortSignal.timeout(1000) });
-  client.socket.send(JSON.stringify({ event: 'media', streamSid, media: { track: 'inbound', payload } }));
-  const [forwarded] = await audioForwarded;
-  assert.equal(forwarded.audio, payload);
-  assert.equal(app.logs.some(([message]) => message === '[Live] owner access enabled'), false);
-  assert.equal(provider.commands.some((command) => command.type === 'session.close'), false);
-  assert.equal(provider.readyState, WebSocket.OPEN);
-  assert.equal(client.socket.readyState, WebSocket.OPEN);
-  assert.equal(app.providers.length, 1);
+  app.sendStart(socket, grantFrom(response));
+  const [{ session }] = await sessionPromise;
+  assertSession(session, true);
   assert.equal(provider.commands.filter((command) => command.type === 'session.start').length, 1);
-  assert.equal(provider.commands.filter((command) => command.type === 'session.update').length, 1);
 });
 
-test('only a correct PIN and signed owner caller grant private tools', async (t) => {
-  for (const [name, from, digits, expectedOwner] of [
-    ['correct owner PIN', ownerPhone, '04231', true],
-    ['incorrect owner PIN', ownerPhone, '00000', false],
-    ['missing owner PIN', ownerPhone, null, false],
-    ['public caller with known PIN', publicPhone, '04231', false],
-  ]) {
-    await t.test(name, async (subtest) => {
-      const app = await harness(subtest);
-      const params = { CallSid: callSid, From: from };
-      if (digits !== null) params.Digits = digits;
-      const response = await app.post('/voice/owner', params);
-      const sessionPromise = started(app.events);
-      await app.startStream(grantFrom(response));
-      const [{ isOwner, session }] = await sessionPromise;
-      assert.equal(isOwner, expectedOwner);
-      const toolNames = session.delegation.responses.tools.map((tool) => tool.name || tool.type);
-      assert.deepEqual(toolNames, expectedOwner
-        ? ['web_search', 'get_codebase_overview', 'search_codebase', 'read_code_snippet']
-        : []);
-      assert.equal(JSON.stringify(app.logs).includes('04231'), false);
+test('pending signed transports are bounded and release capacity after claim, disconnect, or invalid grant', async (t) => {
+  for (const outcome of ['valid grant', 'disconnect', 'invalid grant']) {
+    await t.test(outcome, async (subtest) => {
+      const app = await harness(subtest, {}, { maxPendingConnections: 1 });
+      const response = await app.post('/voice', { CallSid: callSid, From: publicPhone });
+      const first = app.websocket();
+      await once(first, 'open', { signal: AbortSignal.timeout(1000) });
+      assert.equal(app.providers.length, 1);
+      assert.deepEqual(app.providers[0].commands, []);
+      const denied = app.websocket();
+      await assert.rejects(once(denied, 'open', { signal: AbortSignal.timeout(1000) }), /503/);
+      assert.equal(app.providers.length, 1);
+
+      if (outcome === 'valid grant') {
+        const sessionPromise = started(app.events);
+        app.sendStart(first, grantFrom(response));
+        await sessionPromise;
+      } else {
+        const closed = once(first, 'close', { signal: AbortSignal.timeout(1000) });
+        const providerClosed = once(app.providers[0], 'close', { signal: AbortSignal.timeout(1000) });
+        if (outcome === 'disconnect') first.close();
+        else app.sendStart(first, 'invalid-grant');
+        await Promise.all([closed, providerClosed]);
+      }
+
+      const replacement = app.websocket();
+      await once(replacement, 'open', { signal: AbortSignal.timeout(1000) });
+      assert.equal(app.providers.length, 2);
+      assert.deepEqual(app.providers[1].commands, []);
+      assert.equal(app.providers.flatMap((provider) => provider.commands)
+        .filter((command) => command.type === 'session.start').length, outcome === 'valid grant' ? 1 : 0);
     });
   }
 });
 
-test('signed public fallback cannot elevate an owner caller without a PIN', async (t) => {
-  const app = await harness(t);
-  const response = await app.post('/voice/public', { CallSid: callSid, From: ownerPhone });
-  const sessionPromise = started(app.events);
-  await app.startStream(grantFrom(response));
-  const [{ isOwner }] = await sessionPromise;
-  assert.equal(isOwner, false);
+test('an unclaimed signed transport times out and releases its pending slot without starting Live', async (t) => {
+  const app = await harness(t, {}, { maxPendingConnections: 1, startTimeoutMs: 50 });
+  const first = app.websocket();
+  await once(first, 'open', { signal: AbortSignal.timeout(1000) });
+  const providerClosed = once(app.providers[0], 'close', { signal: AbortSignal.timeout(1000) });
+  await Promise.all([once(first, 'close', { signal: AbortSignal.timeout(1000) }), providerClosed]);
+  assert.deepEqual(app.providers[0].commands, []);
+  assert.equal(app.logs.find(([message]) => message === '[Live] call ended')[1].reason, 'startup_timeout');
+  const replacement = app.websocket();
+  await once(replacement, 'open', { signal: AbortSignal.timeout(1000) });
+  assert.equal(app.providers.length, 2);
+  assert.deepEqual(app.providers[1].commands, []);
+});
+
+test('all signed voice routes use actual caller identity and ignore legacy callback fields', async (t) => {
+  for (const route of ['/voice', '/voice/public', '/voice/owner']) {
+    for (const from of [publicPhone, ownerPhone]) {
+      await t.test(`${route}: ${from === ownerPhone ? 'recognized caller' : 'other caller'}`, async (subtest) => {
+        const app = await harness(subtest);
+        const response = await app.post(route, { CallSid: callSid, From: from, Digits: '1234' });
+        assert.doesNotMatch(response.text, /<Gather|<Say|<Redirect/);
+        const sessionPromise = started(app.events);
+        await app.startStream(grantFrom(response));
+        const [{ session }] = await sessionPromise;
+        assertSession(session, from === ownerPhone);
+        assert.equal(app.logs.some(([message]) => /verification/i.test(message)), false);
+      });
+    }
+  }
+});
+
+test('phone audio reaches Live unchanged for recognized and other callers', async (t) => {
+  for (const from of [publicPhone, ownerPhone]) {
+    await t.test(from === ownerPhone ? 'recognized caller' : 'other caller', async (subtest) => {
+      const app = await harness(subtest);
+      const response = await app.post('/voice', { CallSid: callSid, From: from });
+      const sessionPromise = started(app.events);
+      const client = await app.startStream(grantFrom(response));
+      await sessionPromise;
+      const provider = app.providers[0];
+      const payload = Buffer.from(Array.from({ length: 160 }, (_, index) => index % 128)).toString('base64');
+      const audioForwarded = once(provider, 'inputAudio', { signal: AbortSignal.timeout(1000) });
+      client.socket.send(JSON.stringify({ event: 'media', streamSid, media: { track: 'inbound', payload } }));
+      const [forwarded] = await audioForwarded;
+      assert.equal(forwarded.audio, payload);
+      assert.equal(provider.commands.some((command) => command.type === 'session.update'), false);
+      assert.equal(provider.commands.some((command) => command.type === 'session.close'), false);
+      assert.equal(provider.readyState, WebSocket.OPEN);
+      assert.equal(client.socket.readyState, WebSocket.OPEN);
+      assert.equal(app.providers.length, 1);
+    });
+  }
 });
 
 test('unsigned WebSocket upgrade is rejected before provider connection', async (t) => {
@@ -333,10 +332,11 @@ test('WebSocket upgrade accepts Twilio trailing-slash signature normalization', 
   const app = await harness(t);
   const socket = app.websocket(true, `${publicOrigin.replace('https:', 'wss:')}/realtime/`);
   await once(socket, 'open', { signal: AbortSignal.timeout(1000) });
-  assert.equal(app.providers.length, 0);
+  assert.equal(app.providers.length, 1);
+  assert.deepEqual(app.providers[0].commands, []);
 });
 
-test('a consumed stream grant cannot start a second provider connection', async (t) => {
+test('a consumed stream grant cannot start a second provider session', async (t) => {
   const app = await harness(t);
   const response = await app.post('/voice', { CallSid: callSid, From: publicPhone });
   const token = grantFrom(response);
@@ -345,7 +345,10 @@ test('a consumed stream grant cannot start a second provider connection', async 
   await sessionPromise;
   const replay = await app.startStream(token);
   await replay.closed;
-  assert.equal(app.providers.length, 1);
+  assert.equal(app.providers.length, 2);
+  assert.equal(app.providers.flatMap((provider) => provider.commands)
+    .filter((command) => command.type === 'session.start').length, 1);
+  assert.deepEqual(app.providers[1].commands, []);
 });
 
 test('server shutdown closes and finalizes an active Live call before releasing its listener', async (t) => {
