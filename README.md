@@ -38,7 +38,10 @@ background, a dated public portfolio snapshot, and tool rules. Portfolio descrip
 do not establish live availability or completed functionality.
 
 Victoria generates her greeting live in Marin's voice; no prerecorded audio file
-is used. The startup input asks her to begin immediately, while her voice prompt
+is used. The startup input asks her to begin immediately, and the bridge sends the
+same greeting cue once through `session.commentary.append` after `session.started`,
+without waiting for caller speech. Acknowledgment of that cue does not confirm
+spoken audio; the opening still needs a phone listening check. Her voice prompt
 asks for warm, gentle, slightly slower, unhurried speech with brief pauses. Pacing
 is controlled through instructions, with no API speed parameter. Recognizing Tom's
 number changes the greeting and pronouns only; it does not change tool access.
@@ -56,7 +59,8 @@ number changes the greeting and pronouns only; it does not change tool access.
    startup deadline. Caller-number or role custom parameters are ignored.
 5. Only after a valid stream grant and an open provider connection does the server
    send `session.start`, with the greeting in the initial input. It waits for
-   `session.started` before forwarding phone audio. Setup audio is discarded,
+   `session.started` before sending the one-time greeting cue and forwarding phone
+   audio, including silence. Setup audio is discarded,
    never queued or replayed in a burst. There is no PIN prompt or DTMF verification.
    `/voice/owner` and `/voice/public` remain signed compatibility routes with the
    same behavior as `/voice`; `Digits` does not authenticate a caller.

@@ -363,6 +363,67 @@ test('Victoria can send the greeting before the caller sends any ready-state aud
   assert.notEqual(h.controller.getSummary().timings.firstOutputAudioMs, null);
 });
 
+test('the ready greeting cue is sent once for each caller greeting without waiting for speech', async (t) => {
+  for (const isOwner of [false, true]) {
+    await t.test(isOwner ? 'recognized caller' : 'other caller', async (t) => {
+      const h = harness(t, { isOwner });
+      await h.start();
+      h.live.open();
+      const start = h.live.events('session.start')[0];
+      assert.equal(h.live.events('session.commentary.append').length, 0, 'wait for readiness');
+      h.live.receive({ type: 'session.started', session: { id: 'sess_greeting' } });
+      const [cue] = h.live.events('session.commentary.append');
+      assert.ok(cue, 'readiness prompts the greeting before any caller audio');
+      assert.deepEqual(Object.keys(cue).sort(), ['content', 'delegation_id', 'event_id', 'type']);
+      assert.equal(cue.delegation_id, null);
+      assert.equal(cue.content, start.session.input[0].content[0].text);
+      assert.match(cue.event_id, /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
+      assert.notEqual(cue.event_id, start.event_id);
+      assert.equal(h.controller.getSummary().timings.firstInputAudioMs, null);
+
+      h.live.receive({ type: 'session.commentary.appended', client_event_id: cue.event_id });
+      assert.equal(h.twilio.events('media').length, 0, 'acknowledgment does not count as spoken audio');
+      h.live.receive({ type: 'session.started', session: { id: 'sess_greeting' } });
+      assert.equal(h.live.events('session.commentary.append').length, 1, 'acknowledgment and duplicate readiness do not repeat the cue');
+      h.twilio.receive({ event: 'media', media: { payload: FRAME } });
+      h.twilio.receive({ event: 'media', media: { payload: NON_SILENT_FRAME } });
+      assert.deepEqual(h.live.events('session.input_audio.append').map((event) => event.audio), [FRAME, NON_SILENT_FRAME], 'silence and speech keep flowing unchanged');
+      h.live.receive({ type: 'session.output_audio.delta', delta: NON_SILENT_FRAME });
+      assert.equal(h.twilio.events('media')[0].media.payload, NON_SILENT_FRAME);
+      assert.equal(h.live.events('session.commentary.append').length, 1);
+    });
+  }
+});
+
+test('a session that becomes ready during shutdown is closed without a greeting cue', async (t) => {
+  const h = harness(t);
+  await h.start();
+  h.live.open();
+  h.controller.close('caller_stopped');
+  h.live.receive({ type: 'session.started', session: { id: 'sess_closing' } });
+  assert.equal(h.live.events('session.commentary.append').length, 0);
+  assert.equal(h.live.events('session.close').length, 1);
+});
+
+test('a failed greeting delivery closes cleanly without retrying', async (t) => {
+  const h = harness(t);
+  const originalSend = h.live.send.bind(h.live);
+  let attempts = 0;
+  h.live.send = (payload) => {
+    if (JSON.parse(payload).type === 'session.commentary.append') {
+      attempts += 1;
+      throw new Error('fake send failure');
+    }
+    originalSend(payload);
+  };
+  await h.ready();
+  h.live.receive({ type: 'session.started', session: { id: 'sess_fake' } });
+  assert.equal(attempts, 1);
+  assert.equal(h.controller.getSummary().reason, 'greeting_delivery_failed');
+  assert.equal(h.live.events('session.close').length, 1);
+  assert.equal(h.twilio.readyState, 3);
+});
+
 test('Live keeps phone audio full duplex and sends playback marks without a Realtime speech gate', async (t) => {
   const h = harness(t);
   await h.ready();

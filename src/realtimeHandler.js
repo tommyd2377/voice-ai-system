@@ -59,6 +59,7 @@ export function attachLiveCall(socket, {
   let streamSid = null;
   let started = false;
   let startSent = false;
+  let greetingInstruction = null;
   let closing = false;
   let finished = false;
   let isOwner = false;
@@ -169,8 +170,10 @@ export function attachLiveCall(socket, {
 
   const maybeStartSession = () => {
     if (closing || startSent || !streamSid || live?.readyState !== WebSocket.OPEN) return;
+    const session = buildLiveSession({ isOwner });
+    greetingInstruction = session.input[0].content[0].text;
     summary.timings.sessionStartSentMs = elapsed();
-    startSent = command({ type: 'session.start', session: buildLiveSession({ isOwner }) });
+    startSent = command({ type: 'session.start', session });
     if (!startSent) close('session_start_failed');
   };
 
@@ -321,6 +324,10 @@ export function attachLiveCall(socket, {
         callTimer = setTimeout(() => close('call_duration_limit'), limits.maxCallMs);
         callTimer.unref?.();
         logger.info('[Live] session ready', { sessionId: summary.sessionId, isOwner, timings: structuredClone(summary.timings) });
+        // Reinforce the startup greeting once Live is ready, without waiting for speech.
+        if (!command({ type: 'session.commentary.append', delegation_id: null, content: greetingInstruction })) {
+          close('greeting_delivery_failed');
+        }
       } else if (event.type === 'session.usage.updated') {
         updateVoiceUsage(event.usage);
       } else if (!closing && event.type === 'session.output_audio.delta') {
