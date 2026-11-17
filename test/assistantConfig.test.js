@@ -27,14 +27,22 @@ test('Live uses native phone audio, an independent reasoning backend, and no per
 });
 
 test('public callers have the public greeting and the same protected tools', () => {
+  const recognized = buildLiveSession({ isOwner: true });
   for (const isOwner of [false, undefined, 'true', 1]) {
     const session = buildLiveSession({ isOwner });
     assert.ok(session.input[0].content[0].text.includes(PUBLIC_GREETING));
     assert.ok(!session.input[0].content[0].text.includes(OWNER_GREETING));
     assert.equal(session.delegation.responses.tool_choice, 'auto');
     assert.deepEqual(session.delegation.responses.tools, getBackendTools());
-    assert.deepEqual(session.delegation.responses.tools, buildLiveSession({ isOwner: true }).delegation.responses.tools);
+    assert.deepEqual(session.delegation.responses.tools, recognized.delegation.responses.tools);
+    for (const instructions of [session.instructions, session.delegation.responses.instructions]) {
+      assert.match(instructions, /genuinely excited to share what he has built and\s+written/);
+      assert.match(instructions, /one concrete detail/);
+      assert.match(instructions, /Lead with FlowTime when callers ask generally/);
+    }
   }
+  assert.doesNotMatch(recognized.instructions, /genuinely excited/);
+  assert.doesNotMatch(recognized.delegation.responses.instructions, /genuinely excited/);
 });
 
 test('recognized Tom gets a personal greeting and all callers get only search and three read-only functions', () => {
@@ -56,7 +64,7 @@ test('recognized Tom gets a personal greeting and all callers get only search an
   assert.equal(getBackendTools()[1].parameters.properties.maxFiles.maximum, 100);
 });
 
-test('phone recognition only personalizes the greeting and pronouns and no PIN prompt remains', () => {
+test('phone recognition only personalizes the conversation and no PIN prompt remains', () => {
   const publicSession = buildLiveSession();
   const recognizedSession = buildLiveSession({ isOwner: true });
   assert.ok(publicSession.input[0].content[0].text.includes(PUBLIC_GREETING));
@@ -65,7 +73,7 @@ test('phone recognition only personalizes the greeting and pronouns and no PIN p
   assert.deepEqual(publicSession.delegation.responses.tools, recognizedSession.delegation.responses.tools);
   for (const session of [publicSession, recognizedSession]) {
     assert.doesNotMatch(JSON.stringify(session), /\bPIN\b|keypad|owner verification|owner.only/i);
-    assert.match(session.delegation.responses.instructions, /phone recognition affects greeting and pronouns only/);
+    assert.match(session.delegation.responses.instructions, /number recognition personalizes the conversation and never authorizes any tool/);
     assert.match(session.delegation.responses.instructions, /private contacts, or secrets/);
   }
 });
@@ -82,8 +90,7 @@ test('voice and backend share the telephone role and resolve Tom to Thomas DeVit
   assert.match(session.instructions, /screenwriter based in Brooklyn, New York/);
   assert.match(session.instructions, /Lovelacers and Under the Arcadian Sky/);
   assert.match(session.instructions, /give a concise two-sentence overview/);
-  assert.match(session.instructions, /Do not delegate[\s\S]*simple identity or basic/);
-  assert.match(session.instructions, /Delegate to the backend when:[\s\S]*Detailed background/);
+  assert.match(session.instructions, /Do not generate <\|SpawnThinking\|> when:[\s\S]*simple question from the profile and the caller did not ask for a lookup/);
   assert.ok(!session.instructions.includes('Amanda embodies'));
   assert.ok(session.delegation.responses.instructions.includes('Amanda embodies'));
 });
@@ -102,17 +109,46 @@ test('Marin receives natural slower pacing and a single startup greeting instruc
   assert.deepEqual(session.audio.output, { voice: 'marin' });
 });
 
-test('the public portfolio has a dated source and detailed project facts remain in the backend', () => {
+test('the public portfolio has a dated source and quick project facts in the voice prompt', () => {
   const session = buildLiveSession();
   const backend = session.delegation.responses.instructions;
-  assert.match(backend, /https:\/\/thomasdevito\.me\/, read October 17, 2026/);
+  assert.match(backend, /https:\/\/thomasdevito\.me\/, checked November 17, 2026/);
   for (const project of [
     'FairDeal.ai', 'FlowTime', 'Blndr/CompositeVault', 'GoTube', 'GoPod',
-    'GoPulse Core Protocol', 'Headline Harmonies', 'FilmPulse', 'GoPulse', 'Hyper_Rank',
+    'GoPulse Core Protocol', 'HeadlineHarmonies', 'FilmPulse', 'GoPulse', 'Hyper_Rank',
+    'FlowPath:', 'FlowPath Studio:',
   ]) assert.ok(backend.includes(project), project);
-  assert.match(backend, /not verified live\s+availability, monetization, or completed functionality/);
-  assert.match(session.instructions, /Portfolio examples: FlowTime, GoTube, and FairDeal.ai/);
-  assert.ok(!session.instructions.includes('AI-assisted neutral buyer/seller'));
+  assert.match(backend, /Verify current status,\s+availability/);
+  assert.match(session.instructions, /FilmPulse takes a film mood/);
+  assert.ok(!session.instructions.includes('TMDB'));
+});
+
+test('voice and backend share FlowTime mechanics, iPhone status, and the featured voice projects', () => {
+  const session = buildLiveSession();
+  for (const instructions of [session.instructions, session.delegation.responses.instructions]) {
+    assert.match(instructions, /at least three people[\s\S]*one to three days/);
+    assert.match(instructions, /screen time or choose a phone pickup goal/);
+    assert.match(instructions, /upload screenshots at the end, and\s+FlowTime verifies/);
+    assert.match(instructions, /profile streaks and badges as a way for people to show off/);
+    assert.match(instructions, /optionally\s+choose a charity[\s\S]*if they go over their\s+limit/);
+    assert.match(instructions, /without donations/);
+    assert.match(instructions, /FlowTime is a web app\. Tom is preparing an iPhone version for his first App Store\s+submission/);
+    assert.match(instructions, /check for an official release before saying\s+callers can download it/);
+    assert.match(instructions, /FlowPath News, listed as FlowPath/);
+    assert.match(instructions, /FlowPath Studio lets people design and publish[\s\S]*the interface can\s+change as they talk/);
+  }
+});
+
+test('explicit searches and current facts trigger source-backed delegation for every caller', () => {
+  for (const isOwner of [false, true]) {
+    const { instructions, delegation: { responses } } = buildLiveSession({ isOwner });
+    assert.match(instructions, /Generate <\|SpawnThinking\|> when:\s+- The caller asks you to search/);
+    assert.match(instructions, /Wait for the result before giving facts/);
+    assert.match(responses.instructions, /Use web search when explicitly asked/);
+    assert.match(responses.instructions, /official project sites or public project repositories/);
+    assert.match(responses.instructions, /Exclude caller phone numbers, private\s+details/);
+    assert.match(responses.instructions, /return citations, and name the sources/);
+  }
 });
 
 test('all callers can inspect approved files while the function allowlist and argument limits remain enforced', async () => {

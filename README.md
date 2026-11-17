@@ -30,12 +30,13 @@ flowchart LR
   numbers, grants, transcript text, and tool contents.
 
 The voice and backend prompts are separate in `src/assistantConfig.js`. The voice
-prompt defines Victoria's personality, greeting, interruption behavior, and when
-to delegate. It includes a small public profile so simple questions about Tom can
-be answered directly. Tom, Thomas, and Tom DeVito refer to Thomas DeVito on this
-phone line unless the caller means someone else. The backend supplies detailed
-background, a dated public portfolio snapshot, and tool rules. Portfolio descriptions
-do not establish live availability or completed functionality.
+prompt defines Victoria's greeting, delivery, and interruption behavior. With
+public callers she shares concrete details about Tom's software and screenplays
+based on their interests. A short profile covers common questions without a
+backend turn. Explicit lookups and current or detailed questions use the backend,
+which contains the dated public portfolio and names the sources it finds. For
+Tom's work, it starts with his portfolio, official project sites, and public
+project repositories. Current availability and releases require current sources.
 
 Victoria generates her greeting live in Marin's voice; no prerecorded audio file
 is used. The startup input asks her to begin immediately, and the bridge sends the
@@ -44,14 +45,15 @@ without waiting for caller speech. Acknowledgment of that cue does not confirm
 spoken audio; the opening still needs a phone listening check. Her voice prompt
 asks for warm, gentle, slightly slower, unhurried speech with brief pauses. Pacing
 is controlled through instructions, with no API speed parameter. Recognizing Tom's
-number changes the greeting and pronouns only; it does not change tool access.
+number personalizes the conversation. Every caller receives the same tools.
 
 ## Call flow and permissions
 
 1. Twilio posts a signed form webhook to `/voice`.
 2. The server verifies `X-Twilio-Signature` against the configured public origin.
 3. The signed webhook issues an in-memory, single-use stream grant bound to the
-   call ID. Grants expire after 60 seconds; at most 1,024 are retained.
+   call ID. The grant keeps the recognition result and discards the caller's
+   phone number. Grants expire after 60 seconds, with at most 1,024 retained.
 4. A valid Twilio WebSocket upgrade starts the OpenAI transport connection while
    the bridge waits for the stream's single-use grant and call ID. This overlaps
    transport setup with the phone start event. Unsigned upgrades never connect to
@@ -182,6 +184,8 @@ are not imported by the server or its tools.
 
 - [Live primary WebSocket](https://developers.openai.com/api/reference/resources/live/primary-websocket)
 - [Responses delegation and tool continuation](https://developers.openai.com/api/docs/guides/live-delegation)
+- [Hosted web search](https://developers.openai.com/api/docs/guides/tools-web-search)
 - [Session lifecycle and usage](https://developers.openai.com/api/docs/guides/live-conversations)
 - [Live prompting](https://developers.openai.com/api/docs/guides/live-prompting)
+- [Twilio Media Streams messages](https://www.twilio.com/docs/voice/media-streams/websocket-messages)
 - [Twilio request security](https://www.twilio.com/docs/usage/security)

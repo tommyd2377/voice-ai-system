@@ -293,8 +293,10 @@ export function attachLiveCall(socket, {
         batch.resultsSent = true;
         batch.continued = true;
         logger.warn('[Live] delegated response did not complete');
-        command({ type: 'session.instructions.append', delegation_id: null,
-          content: 'The backend request failed. Explain that briefly. Do not claim a successful lookup or retry automatically.' });
+        if (!command({ type: 'session.instructions.append', delegation_id: null,
+          content: 'The backend request failed. Explain that briefly. Do not claim a successful lookup or retry automatically.' })) {
+          return close('backend_failure_notice_delivery_failed');
+        }
         maybeContinue();
         return;
       }

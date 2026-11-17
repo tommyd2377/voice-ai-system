@@ -102,11 +102,12 @@ async function harness(t, envOverrides = {}, limitOverrides = {}) {
     assert.equal(server.address(), null);
   });
 
-  function post(path, params, signed = true) {
+  function post(path, params, signed = true, extraHeaders = {}) {
     const body = new URLSearchParams(params).toString();
     const headers = {
       'content-type': 'application/x-www-form-urlencoded',
       'content-length': Buffer.byteLength(body),
+      ...extraHeaders,
     };
     if (signed) headers['X-Twilio-Signature'] = twilio.getExpectedTwilioSignature(authToken, `${publicOrigin}${path}`, params);
     return new Promise((resolve, reject) => {
@@ -191,6 +192,15 @@ test('unsigned HTTP requests are forbidden before a provider can start', async (
     assert.equal(response.status, 403);
     assert.doesNotMatch(response.text, /grantToken|<Gather/);
   }
+  assert.equal(app.providers.length, 0);
+});
+
+test('compressed form requests are rejected before a provider can start', async (t) => {
+  const app = await harness(t);
+  const response = await app.post('/voice', { CallSid: callSid, From: publicPhone }, true, {
+    'content-encoding': 'gzip',
+  });
+  assert.equal(response.status, 415);
   assert.equal(app.providers.length, 0);
 });
 
@@ -380,6 +390,8 @@ test('missing required runtime configuration fails closed without a provider con
       const app = await harness(subtest, { [name]: '' });
       const response = await app.post('/voice', { CallSid: callSid, From: publicPhone });
       assert.equal(response.status, 503);
+      const socket = app.websocket();
+      await assert.rejects(once(socket, 'open', { signal: AbortSignal.timeout(1000) }), /503/);
       assert.equal(app.providers.length, 0);
     });
   }

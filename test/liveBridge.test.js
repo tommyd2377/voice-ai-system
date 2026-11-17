@@ -804,6 +804,17 @@ test('a resumed and completed response clears the previous continuation watchdog
   assert.equal(h.controller.getSummary().backend.responses, 2);
 });
 
+test('failure to deliver a backend failure notice closes the call', async (t) => {
+  const h = harness(t);
+  await h.ready();
+  h.created('response_failed');
+  h.live.bufferedAmount = 256 * 1024 + 1;
+  h.backend({ type: 'response.failed', response: { id: 'response_failed', status: 'failed' } });
+  assert.equal(h.controller.getSummary().reason, 'backend_failure_notice_delivery_failed');
+  assert.equal(h.twilio.readyState, 3);
+  assert.equal(h.live.events('session.instructions.append').length, 0);
+});
+
 test('provider errors stop the call without retrying or accepting more media', async (t) => {
   const h = harness(t);
   await h.ready();

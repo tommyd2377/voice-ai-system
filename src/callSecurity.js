@@ -69,10 +69,8 @@ export function createCallSecurity({ authToken, ownerPhone, now = Date.now } = {
     pruneGrants();
     while (grants.size >= MAX_GRANTS) grants.delete(grants.keys().next().value);
     const token = randomBytes(32).toString('base64url');
-    const normalizedCaller = normalizePhone(callerPhone);
     grants.set(token, {
       callSid,
-      callerPhone: normalizedCaller,
       // Recognition personalizes the greeting; all callers have the same tools.
       isOwner: isOwnerPhone(callerPhone),
       expiresAt: now() + GRANT_TTL_MS,
@@ -87,7 +85,6 @@ export function createCallSecurity({ authToken, ownerPhone, now = Date.now } = {
     if (!grant || grant.callSid !== callSid) return null;
     grants.delete(token);
     return {
-      callerPhone: grant.callerPhone,
       isOwner: grant.isOwner,
     };
   }

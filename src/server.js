@@ -22,7 +22,7 @@ const normalizeStreamUrl = (value) => {
 export function createVoiceServer({ env = process.env, logger = console, connectLive, limits } = {}) {
   const app = express();
   app.disable('x-powered-by');
-  app.use(express.urlencoded({ extended: false, limit: '16kb' }));
+  app.use(express.urlencoded({ extended: false, limit: '16kb', inflate: false }));
   const streamUrl = normalizeStreamUrl(env.TWILIO_STREAM_URL);
   const security = createCallSecurity({
     authToken: env.TWILIO_AUTH_TOKEN,
@@ -79,13 +79,18 @@ export function createVoiceServer({ env = process.env, logger = console, connect
   app.post(['/voice', '/voice/owner', '/voice/public'], signedWebhook, streamCall);
   app.use((error, _req, res, _next) => {
     logger.warn('[Voice] rejected malformed request');
-    res.sendStatus(error.status === 413 ? 413 : 400);
+    res.sendStatus(error.status === 413 || error.status === 415 ? error.status : 400);
   });
 
   const server = http.createServer(app);
-  const wss = streamUrl ? attachLiveServer(server, {
+  const wss = missingConfiguration.length === 0 ? attachLiveServer(server, {
     security, streamUrl, apiKey: env.OPENAI_API_KEY, connectLive, logger, limits,
   }) : null;
+  if (!wss) {
+    server.on('upgrade', (_request, socket) => {
+      socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+    });
+  }
   return { app, server, wss };
 }
 

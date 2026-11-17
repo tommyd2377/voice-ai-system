@@ -49,7 +49,6 @@ test('stream grants preserve verified caller identity, bind CallSid, and cannot 
   assert.match(token, /^[\w-]{43}$/);
   assert.equal(security.consumeGrant({ token, callSid: otherCallSid }), null);
   assert.deepEqual(security.consumeGrant({ token, callSid, callerPhone: '+12025550125' }), {
-    callerPhone: ownerPhone,
     isOwner: true,
   });
   assert.equal(security.consumeGrant({ token, callSid }), null);
@@ -69,7 +68,6 @@ test('stream grants expire after 60 seconds and unused grants have bounded stora
   for (let index = 0; index < 1024; index += 1) newest = security.issueGrant({ callSid });
   assert.equal(security.consumeGrant({ token: oldest, callSid }), null);
   assert.deepEqual(security.consumeGrant({ token: newest, callSid }), {
-    callerPhone: null,
     isOwner: false,
   });
 });
@@ -100,6 +98,6 @@ test('greeting recognition uses the signed caller phone and remains optional', (
   for (const configuredPhone of [undefined, '', 'not-a-phone']) {
     const unconfigured = createCallSecurity({ authToken, ownerPhone: configuredPhone });
     const token = unconfigured.issueGrant({ callSid, callerPhone: ownerPhone });
-    assert.deepEqual(unconfigured.consumeGrant({ token, callSid }), { callerPhone: ownerPhone, isOwner: false });
+    assert.deepEqual(unconfigured.consumeGrant({ token, callSid }), { isOwner: false });
   }
 });
